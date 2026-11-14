@@ -10,11 +10,39 @@ type Hop = {
   detail: string
 }
 
+type WanHop = {
+  ttl: number
+  ip: string
+  ms: number
+  loss: number
+  kind: string
+  asn: string
+  asn_name: string
+  note: string
+}
+
+type WanCard = {
+  hops: WanHop[]
+  nat: string
+  https: string
+  https_kind: string
+  path: string
+}
+
+type Playbook = {
+  id: string
+  look_at: string[]
+  check_first: string
+  never_auto: string[]
+}
+
 type Chain = {
   hops: Hop[]
   conclusion: string
   next: string
   problem_id: string
+  wan: WanCard
+  playbook: Playbook | null
 }
 
 const ORDER: Hop[] = [
@@ -28,9 +56,14 @@ const ORDER: Hop[] = [
 
 const KEEP = 16
 const GAP_MS = 6000
+const SITE_KEY = 'lanwatch.wan.site'
 
 function noteKey(id: string) {
   return `lanwatch.note.${id}`
+}
+
+function hopTitle(hop: WanHop) {
+  return [hop.ip, hop.asn, hop.asn_name].filter(Boolean).join(' ')
 }
 
 function watchedLabel(ms: number) {
@@ -54,11 +87,13 @@ export default function App() {
   const [ticks, setTicks] = useState<Record<string, string[]>>({})
   const [startedAt, setStartedAt] = useState<number | null>(null)
   const [now, setNow] = useState(() => Date.now())
+  const [site, setSite] = useState('')
   const hadResult = useRef(false)
   const running = useRef(false)
   const again = useRef(false)
   const timer = useRef<number | null>(null)
   const history = useRef<Record<string, string[]>>({})
+  const siteRef = useRef('')
 
   function clearTimer() {
     if (timer.current != null) {
@@ -93,7 +128,7 @@ export default function App() {
     clearTimer()
     if (manual || !hadResult.current) setDim(true)
     try {
-      const next = await invoke<Chain>('read_chain')
+      const next = await invoke<Chain>('read_chain', { site: siteRef.current })
       hadResult.current = true
       setStartedAt((at) => at ?? Date.now())
       setFailed(false)
@@ -113,7 +148,25 @@ export default function App() {
     }
   }
 
+  function rememberSite(value: string) {
+    const next = value.trim()
+    siteRef.current = next
+    setSite(next)
+    try {
+      localStorage.setItem(SITE_KEY, next)
+    } catch {
+      /* the field still shows what was typed */
+    }
+  }
+
   useEffect(() => {
+    try {
+      const saved = localStorage.getItem(SITE_KEY) ?? ''
+      setSite(saved)
+      siteRef.current = saved.trim()
+    } catch {
+      siteRef.current = ''
+    }
     void run(true)
     const clock = window.setInterval(() => setNow(Date.now()), 1000)
     return () => {
@@ -184,6 +237,63 @@ export default function App() {
                   </>
                 ) : null}
               </span>
+              {hop.id === 'wan' && chain?.wan ? (
+                <div className="wan-block">
+                  {chain.wan.hops.length > 0 ? (
+                    <div className="wan-strip">
+                      {chain.wan.path ? <span className="scope">{chain.wan.path}</span> : null}
+                      <ol className="wan-path" aria-label="每一跳的时间和丢包">
+                        {chain.wan.hops.map((step) => {
+                          const title = hopTitle(step)
+                          const answered = step.kind === 'ok' || step.kind === 'loss'
+                          return (
+                            <li
+                              className="wan-hop"
+                              key={`${step.ttl}-${step.ip}`}
+                              data-kind={step.kind}
+                              title={title || undefined}
+                            >
+                              <span className="ttl">{step.ttl}</span>
+                              <span className="ms">{answered ? step.ms : '—'}</span>
+                              {step.note ? <span className="hop-note">{step.note}</span> : null}
+                            </li>
+                          )
+                        })}
+                      </ol>
+                    </div>
+                  ) : null}
+                  {chain.wan.nat ? <p className="wan-fact">{chain.wan.nat}</p> : null}
+                  {chain.wan.https ? (
+                    <p className="wan-fact" data-kind={chain.wan.https_kind}>
+                      {chain.wan.https}
+                    </p>
+                  ) : null}
+                  <input
+                    className="note site"
+                    value={site}
+                    maxLength={253}
+                    placeholder="打不开的网址"
+                    aria-label="要核对证书的网址"
+                    autoComplete="off"
+                    spellCheck={false}
+                    onChange={(event) => setSite(event.target.value)}
+                    onBlur={(event) => {
+                      const next = event.currentTarget.value.trim()
+                      const changed = next !== siteRef.current
+                      const button = (event.relatedTarget as HTMLElement | null)?.id === 'again'
+                      rememberSite(event.currentTarget.value)
+                      if (changed && !button) void run(true)
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key !== 'Enter') return
+                      event.preventDefault()
+                      rememberSite(event.currentTarget.value)
+                      event.currentTarget.blur()
+                      void run(true)
+                    }}
+                  />
+                </div>
+              ) : null}
               {problem ? (
                 <input
                   className="note"
@@ -205,7 +315,27 @@ export default function App() {
       </ol>
       <div className="action">
         <p className="next">{next}</p>
-        <button type="button" onClick={() => void run(true)} disabled={dim}>
+        {chain?.playbook ? (
+          <section className="playbook" aria-label="这一步怎么看">
+            <p>
+              <span>看</span>
+              {chain.playbook.look_at.join('，')}
+            </p>
+            <p>
+              <span>不要</span>
+              {chain.playbook.never_auto.join('，')}
+            </p>
+          </section>
+        ) : null}
+        <button
+          id="again"
+          type="button"
+          onClick={() => {
+            rememberSite(site)
+            void run(true)
+          }}
+          disabled={dim}
+        >
           {dim ? '正在测' : '再测一次'}
         </button>
         <p className="domains">lanwatch.cn · lanwatch.net</p>
