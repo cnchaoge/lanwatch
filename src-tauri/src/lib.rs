@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod wan;
+
 use serde::Serialize;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
@@ -43,6 +45,8 @@ struct Chain {
     conclusion: String,
     next: String,
     problem_id: String,
+    wan: wan::WanCard,
+    playbook: Option<wan::Playbook>,
 }
 
 struct Readings {
@@ -84,6 +88,12 @@ struct Readings {
     gw_mac_changed: bool,
     tx_bps: i64,
     rx_bps: i64,
+    wan_hops: Vec<wan::WanHop>,
+    wan_traced: bool,
+    dest_loss: f64,
+    nat_line: String,
+    https_kind: String,
+    https_line: String,
 }
 
 fn hop(id: &str, name: &str, mark: Mark, number: i64, unit: &str, detail: &str) -> Hop {
@@ -164,26 +174,59 @@ fn judge(r: &Readings) -> Chain {
         computer.mark = "慢".to_string();
     }
 
-    let hops = vec![computer, nic, router, dns, proxy, wan];
+    let hops = vec![computer, nic, router, dns, proxy, wan.clone()];
+    let advice = wan::advise(&wan.mark, &r.https_kind, r.dest_loss);
 
     let problem = hops
         .iter()
         .find(|h| h.mark == "断")
         .or_else(|| hops.iter().find(|h| h.mark == "慢"));
     let (conclusion, next, problem_id) = match problem {
-        Some(h) => (conclusion_for(h), next_for(h), h.id.clone()),
+        Some(h) if h.id != "wan" => (conclusion_for(h), next_for(h), h.id.clone()),
+        Some(_) => {
+            let conclusion = advice
+                .conclusion
+                .clone()
+                .unwrap_or_else(|| conclusion_for(&wan));
+            let next = advice.next.clone().unwrap_or_else(|| next_for(&wan));
+            (conclusion, next, "wan".to_string())
+        }
+        None if advice.highlight => {
+            let conclusion = advice
+                .conclusion
+                .clone()
+                .unwrap_or_else(|| "外网是通的。".to_string());
+            let next = advice
+                .next
+                .clone()
+                .unwrap_or_else(|| "不用做什么。".to_string());
+            (conclusion, next, "wan".to_string())
+        }
         None => (
             "从这台电脑到外网是通的。".to_string(),
             "不用做什么。".to_string(),
             String::new(),
         ),
     };
+    let show_book = problem_id == "wan";
 
     Chain {
         hops,
         conclusion,
         next,
         problem_id,
+        wan: wan::WanCard {
+            hops: r.wan_hops.clone(),
+            nat: r.nat_line.clone(),
+            https: r.https_line.clone(),
+            https_kind: r.https_kind.clone(),
+            path: if r.proxy_on && r.wan_traced {
+                "直连".to_string()
+            } else {
+                String::new()
+            },
+        },
+        playbook: if show_book { advice.playbook } else { None },
     }
 }
 
@@ -269,21 +312,37 @@ fn proxy_is_slow(r: &Readings) -> bool {
     r.direct_ok && r.via_ms > 400 && r.via_ms > r.direct_ms.saturating_add(300)
 }
 
-fn judge_wan(r: &Readings) -> Hop {
-    let detail = wan_detail(r);
+fn wan_mark(r: &Readings) -> (Mark, i64) {
     if r.direct_ok {
-        let mark = if r.direct_ms > 400 {
+        let lossy = r.dest_loss > 0.0 && r.dest_loss < 100.0;
+        let mark = if r.direct_ms > 400 || lossy {
             Mark::Slow
         } else {
             Mark::Up
         };
-        return hop("wan", "外网", mark, r.direct_ms, "ms", &detail);
+        return (mark, r.direct_ms);
     }
     if r.via_ok {
         let mark = if r.via_ms > 800 { Mark::Slow } else { Mark::Up };
-        return hop("wan", "外网", mark, r.via_ms, "ms", &detail);
+        return (mark, r.via_ms);
     }
-    hop("wan", "外网", Mark::Down, 0, "ms", &detail)
+    (Mark::Down, 0)
+}
+
+fn judge_wan(r: &Readings) -> Hop {
+    let (mark, number) = wan_mark(r);
+    let detail = if r.wan_traced {
+        wan::summarize(
+            &r.wan_target,
+            r.direct_ok,
+            r.via_ok,
+            &r.wan_hops,
+            r.dest_loss,
+        )
+    } else {
+        wan_detail(r)
+    };
+    hop("wan", "外网", mark, number, "ms", &detail)
 }
 
 fn format_bps(bps: i64) -> String {
@@ -518,6 +577,19 @@ fn ping(target: &str, count: u8, wait_ms: u32) -> (f64, f64) {
     let wait = wait_ms.to_string();
     let output = run_cmd("ping", &["-c", &count, "-W", &wait, target]);
     parse_ping(&output)
+}
+
+fn ping_measured(target: &str, count: u8, wait_ms: u32) -> Option<f64> {
+    if !usable_host(target) {
+        return None;
+    }
+    let count = count.to_string();
+    let wait = wait_ms.to_string();
+    let output = run_cmd("ping", &["-c", &count, "-W", &wait, target]);
+    if !output.contains("packet loss") {
+        return None;
+    }
+    Some(parse_ping(&output).1)
 }
 
 fn replied(avg: f64, loss: f64) -> bool {
@@ -1172,7 +1244,7 @@ fn helper_candidates(extra: &[PathBuf]) -> Vec<PathBuf> {
     paths
 }
 
-fn gather(extra_helpers: &[PathBuf]) -> Readings {
+fn gather(extra_helpers: &[PathBuf], site: &str) -> Readings {
     let (mut iface, gateway) = get_primary_interface();
     if iface.is_empty() {
         iface = first_lan_iface();
@@ -1255,6 +1327,68 @@ fn gather(extra_helpers: &[PathBuf]) -> Readings {
     let gw_replied = replied(gw_avg, gw_loss);
     let (dns_ok, dns_ms) = dns_result;
     let (direct_ok, direct_ms, wan_target) = direct;
+    let trace_target = if wan_target.is_empty() {
+        ALI_DNS.to_string()
+    } else {
+        wan_target.clone()
+    };
+    let https_host = wan::resolve_site(site).unwrap_or_default();
+    let invalid_site = !site.trim().is_empty() && https_host.is_empty();
+    let proxy_for_https = if proxy_path.on && proxy_path.accepting {
+        proxy_url(&proxy_path.kind, &proxy_path.address)
+    } else {
+        String::new()
+    };
+    let (raw_hops, measured_loss, stun, web_ip, https_raw, name_lookup) =
+        std::thread::scope(|scope| {
+            let target = trace_target.clone();
+            let trace = scope.spawn(move || wan::trace_path(&target));
+            let target = trace_target.clone();
+            let loss = scope.spawn(move || ping_measured(&target, 3, 1000));
+            let stun = scope.spawn(wan::stun_map);
+            let web = scope.spawn(wan::web_egress);
+            let host = https_host.clone();
+            let proxy = proxy_for_https.clone();
+            let https = scope.spawn(move || {
+                if host.is_empty() {
+                    wan::HttpsRaw::not_run()
+                } else if proxy.is_empty() {
+                    wan::https_probe(&host, None)
+                } else {
+                    wan::https_probe(&host, Some(proxy.as_str()))
+                }
+            });
+            let host = https_host.clone();
+            let lookup = scope.spawn(move || {
+                if host.is_empty() {
+                    wan::NameLookup::Unchecked
+                } else {
+                    wan::direct_lookup(&host)
+                }
+            });
+            (
+                trace.join().unwrap_or_default(),
+                loss.join().unwrap_or(None),
+                stun.join().unwrap_or((String::new(), None)),
+                web.join().unwrap_or_default(),
+                https.join().unwrap_or_else(|_| wan::HttpsRaw::not_run()),
+                lookup.join().unwrap_or(wan::NameLookup::Unchecked),
+            )
+        });
+    let wan_hops = wan::finish_probes(&raw_hops, direct_ok);
+    let (mapped_ip, symmetric) = stun;
+    let nat_line = wan::nat_fact(&nic_ip, &mapped_ip, &web_ip, symmetric, &wan_hops);
+    let (https_kind, https_line) = if invalid_site {
+        ("input".to_string(), "网址没法识别".to_string())
+    } else {
+        wan::classify_https(
+            &https_host,
+            proxy_path.on && proxy_path.accepting,
+            &https_raw,
+            name_lookup,
+        )
+    };
+    let dest_loss = measured_loss.unwrap_or(-1.0);
     let gw_macs = macs_for(&arp, &gateway);
     let self_macs = macs_for(&arp, &nic_ip);
     let gw_mac = if gw_macs.len() == 1 {
@@ -1303,21 +1437,27 @@ fn gather(extra_helpers: &[PathBuf]) -> Readings {
         gw_mac_changed,
         tx_bps,
         rx_bps,
+        wan_hops,
+        wan_traced: true,
+        dest_loss,
+        nat_line,
+        https_kind,
+        https_line,
     }
 }
 
-fn read_chain_now(extra_helpers: &[PathBuf]) -> Chain {
-    judge(&gather(extra_helpers))
+fn read_chain_now(extra_helpers: &[PathBuf], site: &str) -> Chain {
+    judge(&gather(extra_helpers, site))
 }
 
 #[tauri::command]
-fn read_chain(app: tauri::AppHandle) -> Chain {
+fn read_chain(app: tauri::AppHandle, site: Option<String>) -> Chain {
     use tauri::Manager;
     let mut extra = Vec::new();
     if let Ok(dir) = app.path().resource_dir() {
         extra.push(dir.join("wifi-helper"));
     }
-    read_chain_now(&extra)
+    read_chain_now(&extra, site.unwrap_or_default().as_str())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1372,6 +1512,12 @@ mod tests {
             gw_mac_changed: false,
             tx_bps: 0,
             rx_bps: 0,
+            wan_hops: Vec::new(),
+            wan_traced: false,
+            dest_loss: -1.0,
+            nat_line: String::new(),
+            https_kind: String::new(),
+            https_line: String::new(),
         }
     }
 
@@ -1394,6 +1540,9 @@ mod tests {
         assert_eq!(chain.conclusion, "从这台电脑到外网是通的。");
         assert_eq!(chain.next, "不用做什么。");
         assert_eq!(chain.problem_id, "");
+        assert!(chain.playbook.is_none());
+        assert!(chain.wan.hops.is_empty());
+        assert!(chain.wan.https.is_empty());
         assert_eq!(chain.hops[4].number, 0);
         assert_eq!(
             chain
@@ -1608,10 +1757,14 @@ mod tests {
         assert_eq!(chain.hops[4].mark, "通");
         assert_eq!(chain.problem_id, "wan");
         assert_eq!(chain.conclusion, "出网断在外网。");
-        assert_eq!(
-            chain.next,
-            "前面都过了，外网没有回应。重启光猫，或过几分钟再测。"
-        );
+        assert_eq!(chain.next, wan::playbook("wan-down").check_first);
+        assert!(chain.next.contains("不是证书问题"));
+        assert!(chain
+            .playbook
+            .unwrap()
+            .never_auto
+            .iter()
+            .any(|line| line.contains("不要自动重启光猫")));
     }
 
     #[test]
@@ -1622,6 +1775,137 @@ mod tests {
         assert_eq!(chain.problem_id, "wan");
         assert_eq!(chain.hops[5].mark, "慢");
         assert_eq!(chain.conclusion, "出网慢在外网。");
+        assert_eq!(chain.next, wan::playbook("wan-slow").check_first);
+    }
+
+    fn sample_hops() -> Vec<wan::WanHop> {
+        vec![
+            wan::WanHop {
+                ttl: 1,
+                ip: "192.168.1.1".into(),
+                ms: 2,
+                loss: 0,
+                kind: "ok".into(),
+                asn: String::new(),
+                asn_name: String::new(),
+                note: "192.168.1.1".into(),
+            },
+            wan::WanHop {
+                ttl: 4,
+                ip: "203.0.113.9".into(),
+                ms: 21,
+                loss: 0,
+                kind: "ok".into(),
+                asn: "AS4134".into(),
+                asn_name: "CHINANET-BACKBONE".into(),
+                note: "AS4134".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn traced_outside_keeps_the_mark_and_adds_hop_nat_and_certificate_facts() {
+        let mut r = healthy();
+        r.wan_traced = true;
+        r.wan_hops = sample_hops();
+        r.dest_loss = 0.0;
+        r.nat_line = "NAT 192.168.1.20 → 203.0.113.8".into();
+        r.https_kind = "ok".into();
+        r.https_line = "www.baidu.com · 证书正常".into();
+        let chain = judge(&r);
+        assert_eq!(chain.hops[5].mark, "通");
+        assert_eq!(chain.problem_id, "");
+        assert!(chain.playbook.is_none());
+        assert_eq!(
+            chain.hops[5].detail,
+            "223.5.5.5 · 2 跳 · 终点丢包 0% · AS4134 CHINANET-BACKBONE"
+        );
+        assert_eq!(chain.wan.nat, "NAT 192.168.1.20 → 203.0.113.8");
+        assert_eq!(chain.wan.https_kind, "ok");
+        assert_eq!(chain.wan.hops.len(), 2);
+        assert_eq!(chain.conclusion, "从这台电脑到外网是通的。");
+    }
+
+    #[test]
+    fn destination_loss_slows_the_outside_without_calling_it_a_certificate() {
+        let mut r = healthy();
+        r.wan_traced = true;
+        r.dest_loss = 33.0;
+        r.https_kind = "ok".into();
+        let chain = judge(&r);
+        assert_eq!(chain.hops[5].mark, "慢");
+        assert_eq!(chain.problem_id, "wan");
+        assert_eq!(chain.conclusion, "出网慢在外网。");
+        assert_eq!(chain.playbook.unwrap().id, "wan-loss");
+        assert!(chain.hops[5].detail.contains("终点丢包 33%"));
+    }
+
+    #[test]
+    fn a_bad_certificate_stays_up_and_is_not_a_dead_path() {
+        let mut r = healthy();
+        r.https_kind = "cert".into();
+        r.https_line = "pay.example · 证书过期 · 连得上".into();
+        let chain = judge(&r);
+        assert_eq!(chain.hops[5].mark, "通");
+        assert_eq!(chain.problem_id, "wan");
+        assert_eq!(chain.conclusion, "外网是通的。打不开是证书问题。");
+        assert_eq!(chain.wan.https, "pay.example · 证书过期 · 连得上");
+        assert_eq!(chain.playbook.unwrap().id, "wan-cert");
+        assert!(!chain.next.contains("重启光猫"));
+    }
+
+    #[test]
+    fn an_unreachable_site_is_not_described_as_a_certificate() {
+        let mut r = healthy();
+        r.https_kind = "down".into();
+        r.https_line = "pay.example · 连不上".into();
+        let chain = judge(&r);
+        assert_eq!(chain.hops[5].mark, "通");
+        assert_eq!(chain.conclusion, "外网是通的。这个网址连不上。");
+        assert!(!chain.conclusion.contains("证书"));
+        assert_eq!(chain.playbook.unwrap().id, "wan-site");
+    }
+
+    #[test]
+    fn an_earlier_break_keeps_the_conclusion_when_the_certificate_also_fails() {
+        let mut r = healthy();
+        r.gw_replied = false;
+        r.gw_loss = 100.0;
+        r.https_kind = "cert".into();
+        r.https_line = "pay.example · 证书过期 · 连得上".into();
+        let chain = judge(&r);
+        assert_eq!(chain.problem_id, "router");
+        assert_eq!(chain.conclusion, "出网断在路由器。");
+        assert!(chain.playbook.is_none());
+        assert_eq!(chain.wan.https_kind, "cert");
+    }
+
+    #[test]
+    fn proxy_path_labels_the_direct_hops() {
+        let mut r = healthy();
+        r.proxy_on = true;
+        r.proxy_accepting = true;
+        r.via_tested = true;
+        r.via_ok = true;
+        r.via_ms = 220;
+        r.direct_ok = false;
+        r.direct_ms = 0;
+        r.wan_traced = true;
+        r.wan_hops = vec![wan::WanHop {
+            ttl: 3,
+            ip: String::new(),
+            ms: 0,
+            loss: 0,
+            kind: "down".into(),
+            asn: String::new(),
+            asn_name: String::new(),
+            note: "中断".into(),
+        }];
+        let chain = judge(&r);
+        assert_eq!(chain.hops[5].mark, "通");
+        assert_eq!(chain.hops[5].detail, "经代理出去 · 直连在第 3 跳中断");
+        assert_eq!(chain.wan.path, "直连");
+        assert_eq!(chain.problem_id, "");
     }
 
     #[test]
@@ -1771,13 +2055,18 @@ en0   1500  192.168.1   192.168.1.20       10 0 50 20 0 80 0
     #[test]
     #[ignore]
     fn live_on_this_mac() {
-        let chain = read_chain_now(&[]);
+        let chain = read_chain_now(&[], "");
         eprintln!("{}\n{}", chain.conclusion, chain.next);
         for hop in &chain.hops {
             eprintln!(
                 "{} {} {} {}  {}",
                 hop.name, hop.mark, hop.number, hop.unit, hop.detail
             );
+        }
+        eprintln!("nat {}", chain.wan.nat);
+        eprintln!("https {}", chain.wan.https);
+        for hop in &chain.wan.hops {
+            eprintln!("  {} {}ms {} {}", hop.ttl, hop.ms, hop.note, hop.ip);
         }
         assert_eq!(chain.hops.len(), 6);
     }

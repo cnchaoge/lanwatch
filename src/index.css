@@ -223,6 +223,108 @@ li {
   border-bottom-color: #1c1915;
 }
 
+.wan-block {
+  grid-column: 2 / -1;
+  grid-row: 3;
+  margin-top: 0.15rem;
+}
+
+.hop:has(.wan-block) > .note {
+  grid-row: 4;
+}
+
+.wan-strip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 0.4rem 0.85rem;
+  margin-top: 0.2rem;
+}
+
+.wan-strip .scope {
+  color: #6f675c;
+  font-size: 0.72rem;
+  padding-bottom: 0.15rem;
+}
+
+.wan-path {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 0.85rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.wan-hop {
+  min-width: 2.8rem;
+}
+
+.wan-hop .ttl,
+.wan-hop .ms,
+.wan-hop .hop-note {
+  display: block;
+  line-height: 1.25;
+}
+
+.wan-hop .ttl,
+.wan-hop .hop-note {
+  color: #6f675c;
+  font-size: 0.68rem;
+}
+
+.wan-hop .ttl,
+.wan-hop .ms {
+  font-family: "SF Mono", ui-monospace, "Menlo", monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+.wan-hop .ms {
+  color: #1c1915;
+  font-size: 0.84rem;
+}
+
+.wan-hop[data-kind="silent"] .ms,
+.wan-hop[data-kind="silent"] .hop-note {
+  color: #8a8176;
+}
+
+.wan-hop[data-kind="loss"] .ms,
+.wan-hop[data-kind="loss"] .hop-note {
+  color: #7a4508;
+}
+
+.wan-hop[data-kind="down"] .ms,
+.wan-hop[data-kind="down"] .hop-note {
+  color: #92231f;
+}
+
+.wan-fact {
+  margin-top: 0.18rem;
+  color: #6f675c;
+  font-size: 0.82rem;
+  line-height: 1.35;
+}
+
+.wan-fact[data-kind="ok"] {
+  color: #1b5e45;
+}
+
+.wan-fact[data-kind="cert"],
+.wan-fact[data-kind="tls"] {
+  color: #7a4508;
+}
+
+.wan-fact[data-kind="down"] {
+  color: #92231f;
+}
+
+.wan-block .site {
+  grid-row: auto;
+  grid-column: auto;
+  margin-top: 0.35rem;
+}
+
 .action {
   margin-top: auto;
   padding-top: 1.2rem;
@@ -234,6 +336,24 @@ li {
   font-family: "Songti SC", "Noto Serif SC", "STSong", serif;
   font-size: 1.05rem;
   line-height: 1.5;
+}
+
+.playbook {
+  margin-top: 0.7rem;
+  color: #6f675c;
+  font-size: 0.82rem;
+  line-height: 1.45;
+}
+
+.playbook p + p {
+  margin-top: 0.15rem;
+}
+
+.playbook span {
+  display: inline-block;
+  min-width: 2.4rem;
+  margin-right: 0.35rem;
+  color: #1c1915;
 }
 
 button {
