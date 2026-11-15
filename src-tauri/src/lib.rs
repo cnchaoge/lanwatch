@@ -1339,32 +1339,42 @@ fn gather(extra_helpers: &[PathBuf], site: &str) -> Readings {
     } else {
         String::new()
     };
-    let (raw_hops, measured_loss, stun, web_ip, https_raw) = std::thread::scope(|scope| {
-        let target = trace_target.clone();
-        let trace = scope.spawn(move || wan::trace_path(&target));
-        let target = trace_target.clone();
-        let loss = scope.spawn(move || ping_measured(&target, 3, 1000));
-        let stun = scope.spawn(wan::stun_map);
-        let web = scope.spawn(wan::web_egress);
-        let host = https_host.clone();
-        let proxy = proxy_for_https.clone();
-        let https = scope.spawn(move || {
-            if host.is_empty() {
-                wan::HttpsRaw::not_run()
-            } else if proxy.is_empty() {
-                wan::https_probe(&host, None)
-            } else {
-                wan::https_probe(&host, Some(proxy.as_str()))
-            }
+    let (raw_hops, measured_loss, stun, web_ip, https_raw, name_lookup) =
+        std::thread::scope(|scope| {
+            let target = trace_target.clone();
+            let trace = scope.spawn(move || wan::trace_path(&target));
+            let target = trace_target.clone();
+            let loss = scope.spawn(move || ping_measured(&target, 3, 1000));
+            let stun = scope.spawn(wan::stun_map);
+            let web = scope.spawn(wan::web_egress);
+            let host = https_host.clone();
+            let proxy = proxy_for_https.clone();
+            let https = scope.spawn(move || {
+                if host.is_empty() {
+                    wan::HttpsRaw::not_run()
+                } else if proxy.is_empty() {
+                    wan::https_probe(&host, None)
+                } else {
+                    wan::https_probe(&host, Some(proxy.as_str()))
+                }
+            });
+            let host = https_host.clone();
+            let lookup = scope.spawn(move || {
+                if host.is_empty() {
+                    wan::NameLookup::Unchecked
+                } else {
+                    wan::direct_lookup(&host)
+                }
+            });
+            (
+                trace.join().unwrap_or_default(),
+                loss.join().unwrap_or(None),
+                stun.join().unwrap_or((String::new(), None)),
+                web.join().unwrap_or_default(),
+                https.join().unwrap_or_else(|_| wan::HttpsRaw::not_run()),
+                lookup.join().unwrap_or(wan::NameLookup::Unchecked),
+            )
         });
-        (
-            trace.join().unwrap_or_default(),
-            loss.join().unwrap_or(None),
-            stun.join().unwrap_or((String::new(), None)),
-            web.join().unwrap_or_default(),
-            https.join().unwrap_or_else(|_| wan::HttpsRaw::not_run()),
-        )
-    });
     let wan_hops = wan::finish_probes(&raw_hops, direct_ok);
     let (mapped_ip, symmetric) = stun;
     let nat_line = wan::nat_fact(&nic_ip, &mapped_ip, &web_ip, symmetric, &wan_hops);
@@ -1375,6 +1385,7 @@ fn gather(extra_helpers: &[PathBuf], site: &str) -> Readings {
             &https_host,
             proxy_path.on && proxy_path.accepting,
             &https_raw,
+            name_lookup,
         )
     };
     let dest_loss = measured_loss.unwrap_or(-1.0);

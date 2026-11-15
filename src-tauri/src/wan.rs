@@ -390,10 +390,168 @@ impl HttpsRaw {
     }
 }
 
-/// Certificate wording requires a completed TCP connect.
-/// Lookup failures and timeouts stay connectivity facts.
-pub fn classify_https(host: &str, via_proxy: bool, raw: &HttpsRaw) -> (String, String) {
-    if !raw.ran || host.is_empty() {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameLookup {
+    Found,
+    Missing,
+    Unchecked,
+}
+
+/// Read a `dig` answer. NXDOMAIN and an empty NOERROR are missing names.
+/// Timeouts stay unchecked so a slow resolver is not called "this name does not exist".
+pub fn lookup_from_dig(text: &str) -> Option<NameLookup> {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("status: nxdomain") || lower.contains("status: refused") {
+        return Some(NameLookup::Missing);
+    }
+    if lower.contains("timed out")
+        || lower.contains("no servers could be reached")
+        || lower.contains("status: servfail")
+    {
+        return Some(NameLookup::Unchecked);
+    }
+    if lower.contains("status: noerror") {
+        return Some(if dig_has_address(text) {
+            NameLookup::Found
+        } else {
+            NameLookup::Missing
+        });
+    }
+    None
+}
+
+fn dig_has_address(text: &str) -> bool {
+    let mut answer = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.contains("ANSWER SECTION") {
+            answer = true;
+            continue;
+        }
+        if answer && trimmed.starts_with(";;") {
+            if trimmed.contains("SECTION") {
+                answer = false;
+            }
+            continue;
+        }
+        if !answer || trimmed.is_empty() || trimmed.starts_with(';') {
+            continue;
+        }
+        let parts: Vec<&str> = trimmed.split_whitespace().collect();
+        if parts.len() >= 5
+            && parts[2].eq_ignore_ascii_case("IN")
+            && (parts[3].eq_ignore_ascii_case("A") || parts[3].eq_ignore_ascii_case("AAAA"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn dig_query(host: &str, kind: &str) -> (NameLookup, String) {
+    let Some((stdout, stderr)) = run_bounded(
+        "dig",
+        &["+time=2", "+tries=1", "+noidnout", host, kind],
+        Duration::from_secs(4),
+    ) else {
+        return (NameLookup::Unchecked, String::new());
+    };
+    let text = format!("{stdout}\n{stderr}");
+    let hit = lookup_from_dig(&text).unwrap_or(NameLookup::Unchecked);
+    (hit, text)
+}
+
+/// Resolve the name on the system DNS path, not through the HTTP proxy.
+/// A local proxy can answer TLS for a name that was never looked up.
+pub fn direct_lookup(host: &str) -> NameLookup {
+    if host.parse::<IpAddr>().is_ok() {
+        return NameLookup::Found;
+    }
+    if site_host(host).is_none() {
+        return NameLookup::Unchecked;
+    }
+    match dig_query(host, "A") {
+        (NameLookup::Found, _) => NameLookup::Found,
+        (NameLookup::Missing, text) => {
+            let lower = text.to_ascii_lowercase();
+            if lower.contains("status: nxdomain") || lower.contains("status: refused") {
+                return NameLookup::Missing;
+            }
+            match dig_query(host, "AAAA") {
+                (NameLookup::Found, _) => NameLookup::Found,
+                (NameLookup::Unchecked, _) => NameLookup::Missing,
+                (other, _) => other,
+            }
+        }
+        (NameLookup::Unchecked, _) => system_lookup(host),
+    }
+}
+
+fn system_lookup(host: &str) -> NameLookup {
+    let host = host.to_string();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let found = (host.as_str(), 443)
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut addrs| addrs.next())
+            .is_some();
+        let _ = tx.send(found);
+    });
+    match rx.recv_timeout(Duration::from_secs(2)) {
+        Ok(true) => NameLookup::Found,
+        Ok(false) => NameLookup::Missing,
+        Err(_) => NameLookup::Unchecked,
+    }
+}
+
+/// A peer certificate is a specific verification failure.
+/// `verify=1` alone is the unspecified code curl also uses for a proxy TLS alert.
+fn peer_certificate(verify: i32, err: &str) -> bool {
+    matches!(verify, 9 | 10 | 18 | 19 | 20 | 21 | 23 | 27 | 62 | 64)
+        || err.contains("expired")
+        || err.contains("not yet valid")
+        || err.contains("subject name")
+        || err.contains("does not match")
+        || err.contains("revoked")
+        || err.contains("self-signed")
+        || err.contains("self signed")
+        || err.contains("in certificate chain")
+        || err.contains("unable to get local issuer")
+        || err.contains("ssl certificate problem")
+}
+
+fn name_was_not_resolved(err: &str) -> bool {
+    err.contains("could not resolve")
+        || err.contains("nxdomain")
+        || err.contains("name or service not known")
+        || err.contains("nodename nor servname")
+        || err.contains("no address associated")
+}
+
+fn proxy_tunnel_failed(err: &str) -> bool {
+    err.contains("tunnel failed")
+        || err.contains("from proxy")
+        || err.contains("proxy connect aborted")
+        || err.contains("connect aborted")
+        || err.contains("received http code 5")
+}
+
+/// Certificate wording requires a resolved name and a peer certificate.
+/// A proxy that accepts TCP, then fails TLS, is still "连不上".
+pub fn classify_https(
+    host: &str,
+    via_proxy: bool,
+    raw: &HttpsRaw,
+    lookup: NameLookup,
+) -> (String, String) {
+    if host.is_empty() {
+        return (String::new(), String::new());
+    }
+    if lookup == NameLookup::Missing {
+        return ("down".to_string(), format!("{host} · 没有解析"));
+    }
+    if !raw.ran {
         return (String::new(), String::new());
     }
     let err = raw.stderr.to_ascii_lowercase();
@@ -402,15 +560,16 @@ pub fn classify_https(host: &str, via_proxy: bool, raw: &HttpsRaw) -> (String, S
     } else {
         host.to_string()
     };
-    if err.contains("could not resolve") {
-        return ("down".to_string(), format!("{head} · 没有解析"));
+    if name_was_not_resolved(&err) {
+        return ("down".to_string(), format!("{host} · 没有解析"));
     }
-    if raw.connect_ms <= 0 {
-        return ("down".to_string(), format!("{head} · 连不上"));
-    }
-    if raw.verify != 0 || err.contains("certificate") || err.contains("subject name") {
+    let cert = peer_certificate(raw.verify, &err);
+    if cert && raw.connect_ms > 0 {
         let why = cert_why(raw.verify, &err);
         return ("cert".to_string(), format!("{head} · {why} · 连得上"));
+    }
+    if raw.connect_ms <= 0 || proxy_tunnel_failed(&err) || (via_proxy && raw.app_ms <= 0) {
+        return ("down".to_string(), format!("{head} · 连不上"));
     }
     if raw.app_ms <= 0 {
         return (
@@ -1218,7 +1377,7 @@ traceroute to 1.1.1.1 (1.1.1.1), 6 hops max, 52 byte packets
             app_ms: 0,
             stderr: "curl: (60) SSL certificate problem: certificate has expired".into(),
         };
-        let (kind, line) = classify_https("shop.example", false, &expired);
+        let (kind, line) = classify_https("shop.example", false, &expired, NameLookup::Found);
         assert_eq!(kind, "cert");
         assert_eq!(line, "shop.example · 证书过期 · 连得上");
 
@@ -1229,7 +1388,7 @@ traceroute to 1.1.1.1 (1.1.1.1), 6 hops max, 52 byte packets
             app_ms: 0,
             stderr: "curl: (28) Timeout was reached".into(),
         };
-        let (kind, line) = classify_https("shop.example", false, &timed_out);
+        let (kind, line) = classify_https("shop.example", false, &timed_out, NameLookup::Found);
         assert_eq!(kind, "down");
         assert_eq!(line, "shop.example · 连不上");
         assert!(!line.contains("证书"));
@@ -1242,7 +1401,7 @@ traceroute to 1.1.1.1 (1.1.1.1), 6 hops max, 52 byte packets
             stderr: "curl: (6) Could not resolve host: shop.example".into(),
         };
         assert_eq!(
-            classify_https("shop.example", false, &unresolved).1,
+            classify_https("shop.example", false, &unresolved, NameLookup::Unchecked).1,
             "shop.example · 没有解析"
         );
 
@@ -1254,7 +1413,7 @@ traceroute to 1.1.1.1 (1.1.1.1), 6 hops max, 52 byte packets
             stderr: "SSL: no alternative certificate subject name matches target host name".into(),
         };
         assert_eq!(
-            classify_https("wrong.host.example", false, &mismatch).1,
+            classify_https("wrong.host.example", false, &mismatch, NameLookup::Found).1,
             "wrong.host.example · 证书域名不符 · 连得上"
         );
 
@@ -1265,7 +1424,7 @@ traceroute to 1.1.1.1 (1.1.1.1), 6 hops max, 52 byte packets
             app_ms: 20,
             stderr: String::new(),
         };
-        let (kind, line) = classify_https("www.baidu.com", true, &trusted);
+        let (kind, line) = classify_https("www.baidu.com", true, &trusted, NameLookup::Found);
         assert_eq!(kind, "ok");
         assert_eq!(line, "www.baidu.com · 经代理 · 证书正常");
 
@@ -1276,7 +1435,10 @@ traceroute to 1.1.1.1 (1.1.1.1), 6 hops max, 52 byte packets
             app_ms: 0,
             stderr: "curl: (35) TLS connect error".into(),
         };
-        assert_eq!(classify_https("a.example", false, &handshake).0, "tls");
+        assert_eq!(
+            classify_https("a.example", false, &handshake, NameLookup::Found).0,
+            "tls"
+        );
     }
 
     #[test]
@@ -1443,7 +1605,8 @@ traceroute to 1.1.1.1 (1.1.1.1), 6 hops max, 52 byte packets
     #[ignore]
     fn live_certificate_words_match_curl() {
         let expired = https_probe("expired.badssl.com", None);
-        let (kind, line) = classify_https("expired.badssl.com", false, &expired);
+        let (kind, line) =
+            classify_https("expired.badssl.com", false, &expired, NameLookup::Unchecked);
         eprintln!(
             "expired {kind} {line} verify={} connect={}",
             expired.verify, expired.connect_ms
@@ -1452,15 +1615,26 @@ traceroute to 1.1.1.1 (1.1.1.1), 6 hops max, 52 byte packets
         assert!(line.contains("证书过期"));
         assert!(line.contains("连得上"));
 
+        assert_eq!(
+            direct_lookup("this-site-does-not-exist-lanwatch-test.invalid"),
+            NameLookup::Missing
+        );
+        assert_eq!(direct_lookup("example.com"), NameLookup::Found);
+
         let missing = https_probe("no-such-host.lanwatch.invalid", None);
-        let (kind, line) = classify_https("no-such-host.lanwatch.invalid", false, &missing);
+        let (kind, line) = classify_https(
+            "no-such-host.lanwatch.invalid",
+            false,
+            &missing,
+            NameLookup::Unchecked,
+        );
         eprintln!("missing {kind} {line}");
         assert_eq!(kind, "down");
         assert!(line.contains("没有解析"));
         assert!(!line.contains("证书"));
 
         let ok = https_probe("example.com", None);
-        let (kind, line) = classify_https("example.com", false, &ok);
+        let (kind, line) = classify_https("example.com", false, &ok, NameLookup::Unchecked);
         eprintln!("ok {kind} {line}");
         assert_eq!(kind, "ok");
 
@@ -1468,6 +1642,86 @@ traceroute to 1.1.1.1 (1.1.1.1), 6 hops max, 52 byte packets
         let (mapped, symmetric) = stun_map();
         eprintln!("egress {egress} mapped {mapped} symmetric {symmetric:?}");
         assert!(!egress.is_empty() || !mapped.is_empty());
+    }
+
+    #[test]
+    fn an_unresolvable_name_is_not_a_certificate_when_the_proxy_fails_tls() {
+        let host = "this-site-does-not-exist-lanwatch-test.invalid";
+        // Captured from curl -x through a proxy that accepts CONNECT and then
+        // sends a TLS alert. verify=1 is unspecified, not a peer certificate,
+        // and time_connect is the connection to the proxy.
+        let proxy_alert = HttpsRaw {
+            ran: true,
+            verify: 1,
+            connect_ms: 12,
+            app_ms: 0,
+            stderr:
+                "curl: (35) OpenSSL/3.0.13: error:0A000438:SSL routines::tlsv1 alert internal error"
+                    .into(),
+        };
+        let (kind, line) = classify_https(host, true, &proxy_alert, NameLookup::Missing);
+        assert_eq!(kind, "down");
+        assert_eq!(line, format!("{host} · 没有解析"));
+        assert!(!line.contains("证书"));
+        assert!(!line.contains("连得上"));
+
+        // Same alert, but the direct lookup already said the name does not exist,
+        // even if the proxy presented something that looks like a bad certificate.
+        let fake_cert = HttpsRaw {
+            ran: true,
+            verify: 18,
+            connect_ms: 20,
+            app_ms: 0,
+            stderr: "curl: (60) SSL certificate problem: self-signed certificate".into(),
+        };
+        let (kind, line) = classify_https(host, true, &fake_cert, NameLookup::Missing);
+        assert_eq!(kind, "down");
+        assert_eq!(line, format!("{host} · 没有解析"));
+        assert!(!line.contains("连得上"));
+
+        // The name exists, the proxy only failed the tunnel: still not a certificate.
+        let (kind, line) =
+            classify_https("expired.badssl.com", true, &proxy_alert, NameLookup::Found);
+        assert_eq!(kind, "down");
+        assert_eq!(line, "expired.badssl.com · 经代理 · 连不上");
+        assert!(!line.contains("证书"));
+
+        let expired = HttpsRaw {
+            ran: true,
+            verify: 10,
+            connect_ms: 30,
+            app_ms: 0,
+            stderr: "curl: (60) SSL certificate problem: certificate has expired".into(),
+        };
+        let (kind, line) = classify_https("expired.badssl.com", true, &expired, NameLookup::Found);
+        assert_eq!(kind, "cert");
+        assert_eq!(line, "expired.badssl.com · 经代理 · 证书过期 · 连得上");
+    }
+
+    #[test]
+    fn dig_nxdomain_is_a_missing_name() {
+        let sample = "\
+;; ->>HEADER<<- opcode: QUERY, status: NXDOMAIN, id: 17967
+;; flags: qr rd ra; QUERY: 1, ANSWER: 0, AUTHORITY: 1, ADDITIONAL: 1
+
+;; QUESTION SECTION:
+;this-site-does-not-exist-lanwatch-test.invalid. IN A
+
+;; AUTHORITY SECTION:
+invalid. 10800 IN SOA localhost. nobody.invalid. 1 3600 1200 604800 10800
+";
+        assert_eq!(lookup_from_dig(sample), Some(NameLookup::Missing));
+        let found = "\
+;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 1
+
+;; ANSWER SECTION:
+example.com. 3600 IN A 1.2.3.4
+";
+        assert_eq!(lookup_from_dig(found), Some(NameLookup::Found));
+        assert_eq!(
+            lookup_from_dig(";; connection timed out; no servers could be reached"),
+            Some(NameLookup::Unchecked)
+        );
     }
 
     #[test]
