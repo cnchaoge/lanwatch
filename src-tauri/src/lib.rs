@@ -96,6 +96,14 @@ struct Readings {
     https_line: String,
     band: String,
     channel: u32,
+    /// Cable link, measured on its own. Independent of `wifi_up`.
+    wired_up: bool,
+    wired_ip: String,
+    wired_label: String,
+    wired_mbps: i64,
+    /// Wi-Fi link, measured on its own. Independent of `wired_up`.
+    wifi_up: bool,
+    wifi_label: String,
     local_proxy_port: u16,
     clash_mode: String,
     redirect_count: u32,
@@ -249,24 +257,54 @@ fn judge(r: &Readings) -> Chain {
 
 fn judge_nic(r: &Readings) -> Hop {
     let detail = nic_detail(r);
-    if !r.nic_up {
+    // One row. Down only when neither link has a usable address.
+    if !r.wired_up && !r.wifi_up {
         return hop("nic", "网卡", Mark::Down, 0, "", &detail);
     }
-    if r.nic_wifi && r.rssi_valid && r.rssi < 0 {
+    let (mark, number, unit) = if r.wired_up && r.wifi_up {
+        // The chain follows the default route. The other link stays in the sentence.
+        if r.nic_wifi {
+            wifi_assessment(r)
+        } else {
+            wired_assessment(r)
+        }
+    } else if r.wifi_up {
+        wifi_assessment(r)
+    } else {
+        wired_assessment(r)
+    };
+    hop("nic", "网卡", mark, number, unit, &detail)
+}
+
+fn wifi_assessment(r: &Readings) -> (Mark, i64, &'static str) {
+    if r.rssi_valid && r.rssi < 0 {
         let mut mark = if r.rssi <= -75 { Mark::Slow } else { Mark::Up };
         if mark == Mark::Up && air_poor(r) {
             mark = Mark::Slow;
         }
-        return hop("nic", "网卡", mark, r.rssi as i64, "dBm", &detail);
+        return (mark, r.rssi as i64, "dBm");
     }
-    if r.nic_wifi && air_poor(r) {
-        return hop("nic", "网卡", Mark::Slow, r.tx_mbps, "", &detail);
+    if air_poor(r) {
+        return (Mark::Slow, r.tx_mbps, "");
     }
-    if !r.nic_wifi && r.mbps > 0 {
-        let mark = if r.mbps < 100 { Mark::Slow } else { Mark::Up };
-        return hop("nic", "网卡", mark, r.mbps, "Mbps", &detail);
+    (Mark::Up, 0, "")
+}
+
+fn wired_assessment(r: &Readings) -> (Mark, i64, &'static str) {
+    let mbps = wired_speed(r);
+    if mbps > 0 {
+        let mark = if mbps < 100 { Mark::Slow } else { Mark::Up };
+        return (mark, mbps, "Mbps");
     }
-    hop("nic", "网卡", Mark::Up, 0, "", &detail)
+    (Mark::Up, 0, "")
+}
+
+fn wired_speed(r: &Readings) -> i64 {
+    if r.wired_mbps > 0 {
+        r.wired_mbps
+    } else {
+        r.mbps
+    }
 }
 
 fn judge_router(r: &Readings) -> Hop {
@@ -402,20 +440,24 @@ fn air_poor(r: &Readings) -> bool {
 }
 
 fn nic_detail(r: &Readings) -> String {
+    if r.wired_up && r.wifi_up {
+        return dual_detail(r);
+    }
+    if r.wifi_up {
+        return wifi_only_detail(r);
+    }
+    if r.wired_up {
+        return wired_only_detail(r);
+    }
     if r.link_local {
         return "没有从路由器拿到地址".to_string();
     }
-    if !r.nic_up {
-        return "没有拿到地址".to_string();
-    }
-    let kind = if r.nic_wifi {
-        if r.nic_label.is_empty() {
-            "Wi-Fi".to_string()
-        } else {
-            r.nic_label.clone()
-        }
-    } else if r.nic_label.is_empty() {
-        "有线".to_string()
+    "没有拿到地址".to_string()
+}
+
+fn wifi_only_detail(r: &Readings) -> String {
+    let kind = if r.nic_label.is_empty() {
+        "Wi-Fi".to_string()
     } else {
         r.nic_label.clone()
     };
@@ -424,19 +466,88 @@ fn nic_detail(r: &Readings) -> String {
     } else {
         format!("{} · {kind}", r.nic_ip)
     };
-    if r.nic_wifi {
-        let radio = band_channel(&r.band, r.channel);
-        if !radio.is_empty() {
-            line = format!("{line} · {radio}");
-        }
+    let radio = band_channel(&r.band, r.channel);
+    if !radio.is_empty() {
+        line = format!("{line} · {radio}");
     }
-    if r.nic_wifi && r.noise_valid && r.noise < 0 {
+    if r.noise_valid && r.noise < 0 {
         line = format!("{line} · 噪声 {}", r.noise);
     }
-    if r.nic_wifi && r.tx_mbps > 0 {
+    if r.tx_mbps > 0 {
         line = format!("{line} · {} Mbps", r.tx_mbps);
     }
     line
+}
+
+fn wired_only_detail(r: &Readings) -> String {
+    let ip = if !r.wired_ip.is_empty() {
+        r.wired_ip.clone()
+    } else {
+        r.nic_ip.clone()
+    };
+    let label = if !r.wired_label.is_empty() {
+        r.wired_label.clone()
+    } else {
+        r.nic_label.clone()
+    };
+    let mut parts = vec!["有线已连".to_string()];
+    if !ip.is_empty() {
+        parts.push(ip);
+    }
+    if !label.is_empty() && label != "有线" {
+        parts.push(label);
+    }
+    parts.join(" · ")
+}
+
+fn wifi_name(r: &Readings) -> String {
+    if !r.wifi_label.is_empty() {
+        return r.wifi_label.clone();
+    }
+    if r.nic_wifi && !r.nic_label.is_empty() {
+        return r.nic_label.clone();
+    }
+    String::new()
+}
+
+/// Both links on the one「网卡」row. The short form is `有线已连 · Wi-Fi 5 GHz · 信道 36`.
+fn dual_detail(r: &Readings) -> String {
+    let mut parts = vec!["有线已连".to_string()];
+    if !r.wired_ip.is_empty() {
+        parts.push(r.wired_ip.clone());
+    }
+    if !r.wired_label.is_empty() {
+        parts.push(r.wired_label.clone());
+    }
+    if r.wired_mbps > 0 {
+        parts.push(format!("{} Mbps", r.wired_mbps));
+    }
+    if !r.band.is_empty() && r.channel > 0 {
+        parts.push(format!("Wi-Fi {}", r.band));
+        parts.push(format!("信道 {}", r.channel));
+    } else if !r.band.is_empty() {
+        parts.push(format!("Wi-Fi {}", r.band));
+    } else if r.channel > 0 {
+        parts.push("Wi-Fi".to_string());
+        parts.push(format!("信道 {}", r.channel));
+    } else {
+        parts.push("Wi-Fi".to_string());
+    }
+    let name = wifi_name(r);
+    if !name.is_empty() {
+        parts.push(name);
+    }
+    if r.noise_valid && r.noise < 0 {
+        parts.push(format!("噪声 {}", r.noise));
+    }
+    // The big number is already the signal when the path is Wi-Fi.
+    if r.rssi_valid && r.rssi < 0 && !r.nic_wifi {
+        parts.push(format!("信号 {}", r.rssi));
+    }
+    if r.tx_mbps > 0 {
+        parts.push(format!("{} Mbps", r.tx_mbps));
+    }
+    parts.join(" · ")
 }
 
 fn router_detail(r: &Readings) -> String {
@@ -653,19 +764,176 @@ fn hardware_port_for(iface: &str) -> String {
     if iface.is_empty() {
         return String::new();
     }
-    let out = run_cmd("networksetup", &["-listallhardwareports"]);
-    let mut port = String::new();
-    for line in out.lines() {
+    let text = run_cmd("networksetup", &["-listallhardwareports"]);
+    parse_hardware_ports(&text)
+        .into_iter()
+        .find(|(_, device)| device == iface)
+        .map(|(port, _)| port)
+        .unwrap_or_default()
+}
+
+fn parse_hardware_ports(text: &str) -> Vec<(String, String)> {
+    let mut ports = Vec::new();
+    let mut name = String::new();
+    for line in text.lines() {
         let t = line.trim();
-        if let Some(name) = t.strip_prefix("Hardware Port:") {
-            port = name.trim().to_string();
-        } else if let Some(dev) = t.strip_prefix("Device:") {
-            if dev.trim() == iface {
-                return port;
+        if let Some(rest) = t.strip_prefix("Hardware Port:") {
+            name = rest.trim().to_string();
+        } else if let Some(rest) = t.strip_prefix("Device:") {
+            let device = rest.trim();
+            if !name.is_empty() && !device.is_empty() {
+                ports.push((name.clone(), device.to_string()));
             }
         }
     }
-    String::new()
+    ports
+}
+
+fn is_wired_port(port: &str) -> bool {
+    if is_wifi_port(port) {
+        return false;
+    }
+    if port.is_empty() {
+        // No hardware-port name. Keep the old single-port reading.
+        return true;
+    }
+    let p = port.to_ascii_lowercase();
+    const SKIP: &[&str] = &[
+        "bridge",
+        "bluetooth",
+        "vpn",
+        "firewire",
+        "vlan",
+        "loopback",
+        "awdl",
+        "llw",
+    ];
+    !SKIP.iter().any(|word| p.contains(word))
+}
+
+fn usable_nic_device(dev: &str) -> bool {
+    let d = dev.to_ascii_lowercase();
+    !(d.is_empty()
+        || d == "lo0"
+        || d.starts_with("utun")
+        || d.starts_with("awdl")
+        || d.starts_with("llw")
+        || d.starts_with("bridge")
+        || d.starts_with("gif")
+        || d.starts_with("stf")
+        || d.starts_with("ap")
+        || d.starts_with("anpi")
+        || d.starts_with("pktap")
+        || d.starts_with("ipsec")
+        || d.starts_with("ppp"))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IfaceSnap {
+    port: String,
+    device: String,
+    wifi: bool,
+    active: bool,
+    ip: String,
+    link_local: bool,
+    mbps: i64,
+}
+
+fn snap_from_dump(port: &str, device: &str, dump: &str) -> IfaceSnap {
+    let ip = ipv4_addr(dump);
+    IfaceSnap {
+        port: port.to_string(),
+        device: device.to_string(),
+        wifi: is_wifi_port(port),
+        active: link_active(dump),
+        link_local: ip.starts_with("169.254."),
+        mbps: media_mbps(dump),
+        ip,
+    }
+}
+
+fn snap_up(snap: &IfaceSnap) -> bool {
+    snap.active && !snap.ip.is_empty() && !snap.link_local
+}
+
+/// `want_wifi` selects one side. The other side is not cleared when this returns.
+/// A real cable wins over a non-ethernet primary (Bluetooth, for example).
+fn pick_up<'a>(snaps: &'a [IfaceSnap], want_wifi: bool, primary: &str) -> Option<&'a IfaceSnap> {
+    let mut first = None;
+    let mut primary_other = None;
+    for snap in snaps {
+        if snap.wifi != want_wifi || !snap_up(snap) {
+            continue;
+        }
+        let kind_ok = want_wifi || is_wired_port(&snap.port);
+        if snap.device == primary && kind_ok {
+            return Some(snap);
+        }
+        if !kind_ok {
+            if snap.device == primary {
+                primary_other = Some(snap);
+            }
+            continue;
+        }
+        if first.is_none() {
+            first = Some(snap);
+        }
+    }
+    first.or(primary_other)
+}
+
+fn path_is_wifi(
+    wifi: Option<&IfaceSnap>,
+    wired: Option<&IfaceSnap>,
+    primary: Option<&IfaceSnap>,
+) -> bool {
+    match (wifi.is_some(), wired.is_some()) {
+        (true, false) => true,
+        (false, true) => false,
+        (true, true) => primary.is_some_and(|snap| snap.wifi && snap_up(snap)),
+        (false, false) => false,
+    }
+}
+
+fn nic_address(
+    primary: Option<&IfaceSnap>,
+    wired: Option<&IfaceSnap>,
+    wifi: Option<&IfaceSnap>,
+    path_wifi: bool,
+) -> String {
+    if let Some(primary) = primary {
+        if snap_up(primary) {
+            return primary.ip.clone();
+        }
+    }
+    if path_wifi {
+        wifi.map(|snap| snap.ip.clone()).unwrap_or_default()
+    } else if let Some(wired) = wired {
+        wired.ip.clone()
+    } else {
+        wifi.map(|snap| snap.ip.clone()).unwrap_or_default()
+    }
+}
+
+fn collect_snaps(primary: &str) -> Vec<IfaceSnap> {
+    let text = run_cmd("networksetup", &["-listallhardwareports"]);
+    let listed = parse_hardware_ports(&text);
+    let mut snaps = Vec::new();
+    let mut seen = Vec::new();
+    for (port, device) in listed {
+        if !usable_nic_device(&device) || seen.iter().any(|seen: &String| seen == &device) {
+            continue;
+        }
+        seen.push(device.clone());
+        let dump = run_cmd("ifconfig", &[&device]);
+        snaps.push(snap_from_dump(&port, &device, &dump));
+    }
+    // The default route can sit on a device the hardware-port list did not name.
+    if usable_nic_device(primary) && !seen.iter().any(|seen| seen == primary) {
+        let dump = run_cmd("ifconfig", &[primary]);
+        snaps.push(snap_from_dump("", primary, &dump));
+    }
+    snaps
 }
 
 fn is_wifi_port(port: &str) -> bool {
@@ -1246,8 +1514,8 @@ fn airport_channel(text: &str) -> u32 {
     wifi_channel(raw)
 }
 
-fn read_radio(iface: &str, wifi: bool, helpers: &[PathBuf]) -> Radio {
-    let empty = Radio {
+fn empty_radio() -> Radio {
+    Radio {
         rssi_valid: false,
         rssi: 0,
         noise_valid: false,
@@ -1255,9 +1523,12 @@ fn read_radio(iface: &str, wifi: bool, helpers: &[PathBuf]) -> Radio {
         tx_mbps: 0,
         band: String::new(),
         channel: 0,
-    };
+    }
+}
+
+fn read_radio(iface: &str, wifi: bool, helpers: &[PathBuf]) -> Radio {
     if !wifi || iface.is_empty() {
-        return empty;
+        return empty_radio();
     }
     for path in helpers {
         if !path.exists() {
@@ -1299,7 +1570,7 @@ fn read_radio(iface: &str, wifi: bool, helpers: &[PathBuf]) -> Radio {
             channel,
         }
     } else {
-        empty
+        empty_radio()
     }
 }
 
@@ -1423,25 +1694,37 @@ fn gather(extra_helpers: &[PathBuf], site: &str) -> Readings {
     if iface.is_empty() {
         iface = first_lan_iface();
     }
-    let dump = if iface.is_empty() {
-        String::new()
-    } else {
-        run_cmd("ifconfig", &[&iface])
-    };
-    let port = hardware_port_for(&iface);
-    let nic_wifi = is_wifi_port(&port);
-    let nic_ip = ipv4_addr(&dump);
-    let link_local = nic_ip.starts_with("169.254.");
-    let nic_up = !iface.is_empty() && link_active(&dump) && !nic_ip.is_empty() && !link_local;
+    // Wired and Wi-Fi are separate reads. One being up does not clear the other.
+    let snaps = collect_snaps(&iface);
+    let wired = pick_up(&snaps, false, &iface);
+    let wifi = pick_up(&snaps, true, &iface);
+    let primary = snaps.iter().find(|snap| snap.device == iface);
+    let wired_up = wired.is_some();
+    let wifi_up = wifi.is_some();
+    let nic_wifi = path_is_wifi(wifi, wired, primary);
+    let nic_up = wired_up || wifi_up;
+    let nic_ip = nic_address(primary, wired, wifi, nic_wifi);
+    let link_local = !nic_up && snaps.iter().any(|snap| snap.link_local);
+    let wifi_device = wifi.map(|snap| snap.device.clone());
+    let wifi_label = wifi_device.as_deref().map(wifi_ssid).unwrap_or_default();
+    let wired_ip = wired.map(|snap| snap.ip.clone()).unwrap_or_default();
+    let wired_label = wired.map(|snap| snap.port.clone()).unwrap_or_default();
+    let wired_mbps = wired.map(|snap| snap.mbps).unwrap_or(0);
     let nic_label = if nic_wifi {
-        wifi_ssid(&iface)
+        wifi_label.clone()
+    } else if wired_up {
+        wired_label.clone()
     } else {
-        port.clone()
+        primary.map(|snap| snap.port.clone()).unwrap_or_default()
     };
-    let mbps = if nic_wifi { 0 } else { media_mbps(&dump) };
+    let mbps = if nic_wifi { 0 } else { wired_mbps };
     let machine = computer_name();
     let helpers = helper_candidates(extra_helpers);
-    let radio = read_radio(&iface, nic_wifi, &helpers);
+    let radio = if let Some(device) = wifi_device.as_deref() {
+        read_radio(device, true, &helpers)
+    } else {
+        empty_radio()
+    };
     let dns = dns_servers();
     let dns_server = dns.first().cloned().unwrap_or_default();
     let has_dns = !dns_server.is_empty();
@@ -1618,6 +1901,12 @@ fn gather(extra_helpers: &[PathBuf], site: &str) -> Readings {
         https_line,
         band: radio.band,
         channel: radio.channel,
+        wired_up,
+        wired_ip,
+        wired_label,
+        wired_mbps,
+        wifi_up,
+        wifi_label,
         local_proxy_port: proxy_path.local_port,
         clash_mode: proxy_path.clash_mode,
         redirect_count: redirect.count,
@@ -1699,6 +1988,12 @@ mod tests {
             https_line: String::new(),
             band: String::new(),
             channel: 0,
+            wired_up: false,
+            wired_ip: String::new(),
+            wired_label: String::new(),
+            wired_mbps: 0,
+            wifi_up: true,
+            wifi_label: String::new(),
             local_proxy_port: 0,
             clash_mode: String::new(),
             redirect_count: 0,
@@ -1782,6 +2077,8 @@ mod tests {
     fn nic_down_is_named_before_the_router() {
         let mut r = healthy();
         r.nic_up = false;
+        r.wifi_up = false;
+        r.wired_up = false;
         r.gw_replied = false;
         r.gw_loss = 100.0;
         let chain = judge(&r);
@@ -1818,6 +2115,8 @@ mod tests {
     fn slow_ethernet_asks_for_the_cable() {
         let mut r = healthy();
         r.nic_wifi = false;
+        r.wifi_up = false;
+        r.wired_up = true;
         r.rssi_valid = false;
         r.mbps = 10;
         let chain = judge(&r);
@@ -2146,6 +2445,8 @@ mod tests {
         let mut r = healthy();
         r.loop_ok = false;
         r.nic_up = false;
+        r.wifi_up = false;
+        r.wired_up = false;
         let chain = judge(&r);
         assert_eq!(chain.problem_id, "computer");
         assert_eq!(chain.conclusion, "出网断在这台电脑。");
@@ -2215,6 +2516,8 @@ round-trip min/avg/max/stddev = 1.101/2.504/4.002/0.900 ms
     fn link_local_means_the_router_gave_no_address() {
         let mut r = healthy();
         r.nic_up = false;
+        r.wifi_up = false;
+        r.wired_up = false;
         r.link_local = true;
         let chain = judge(&r);
         assert_eq!(chain.problem_id, "nic");
@@ -2312,6 +2615,8 @@ en0   1500  192.168.1   192.168.1.20       10 0 50 20 0 80 0
 
         let mut wired = healthy();
         wired.nic_wifi = false;
+        wired.wifi_up = false;
+        wired.wired_up = true;
         wired.rssi_valid = false;
         wired.mbps = 1000;
         wired.band = "5 GHz".into();
@@ -2424,6 +2729,8 @@ en0   1500  192.168.1   192.168.1.20       10 0 50 20 0 80 0
         assert_eq!(chain.conclusion, "外网是通的。这一页在跳转。");
 
         r.nic_up = false;
+        r.wifi_up = false;
+        r.wired_up = false;
         let chain = judge(&r);
         assert_eq!(chain.problem_id, "nic");
         assert_eq!(chain.conclusion, "出网断在网卡。");
@@ -2451,6 +2758,315 @@ en0   1500  192.168.1   192.168.1.20       10 0 50 20 0 80 0
         assert_eq!(chain.wan.https, "www.baidu.com · 证书正常");
         assert!(chain.playbook.is_none());
         assert_eq!(chain.conclusion, "从这台电脑到外网是通的。");
+    }
+
+    fn one_nic(chain: &Chain) {
+        assert_eq!(
+            chain
+                .hops
+                .iter()
+                .map(|hop| hop.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["这台电脑", "网卡", "路由器", "DNS", "代理", "外网"]
+        );
+        assert_eq!(chain.hops.iter().filter(|hop| hop.id == "nic").count(), 1);
+    }
+
+    #[test]
+    fn wifi_only_keeps_the_radio_on_one_card() {
+        let mut r = healthy();
+        r.wifi_up = true;
+        r.wired_up = false;
+        r.band = "5 GHz".into();
+        r.channel = 36;
+        r.noise = -92;
+        r.noise_valid = true;
+        r.tx_mbps = 866;
+        let chain = judge(&r);
+        one_nic(&chain);
+        assert_eq!(chain.hops[1].mark, "通");
+        assert_eq!(chain.hops[1].number, -55);
+        assert_eq!(chain.hops[1].unit, "dBm");
+        assert_eq!(
+            chain.hops[1].detail,
+            "192.168.1.20 · 家里 · 5 GHz · 信道 36 · 噪声 -92 · 866 Mbps"
+        );
+        assert!(!chain.hops[1].detail.contains("有线"));
+        assert!(chain.playbook.is_none());
+    }
+
+    #[test]
+    fn wired_only_says_the_cable_is_up() {
+        let mut r = healthy();
+        r.wifi_up = false;
+        r.wired_up = true;
+        r.nic_wifi = false;
+        r.rssi_valid = false;
+        r.mbps = 1000;
+        r.wired_mbps = 1000;
+        r.nic_label = "USB 10/100/1000 LAN".into();
+        r.band = "5 GHz".into();
+        r.channel = 36;
+        let chain = judge(&r);
+        one_nic(&chain);
+        assert_eq!(chain.hops[1].mark, "通");
+        assert_eq!(chain.hops[1].number, 1000);
+        assert_eq!(chain.hops[1].unit, "Mbps");
+        assert_eq!(
+            chain.hops[1].detail,
+            "有线已连 · 192.168.1.20 · USB 10/100/1000 LAN"
+        );
+        assert!(!chain.hops[1].detail.contains("信道"));
+        assert!(!chain.hops[1].detail.contains("Wi-Fi"));
+    }
+
+    #[test]
+    fn both_links_share_one_nic_row() {
+        let mut r = healthy();
+        r.wired_up = true;
+        r.wifi_up = true;
+        r.nic_wifi = true;
+        r.nic_label.clear();
+        r.wifi_label.clear();
+        r.band = "5 GHz".into();
+        r.channel = 36;
+        r.noise_valid = false;
+        r.tx_mbps = 0;
+        let chain = judge(&r);
+        one_nic(&chain);
+        assert_eq!(chain.hops[1].mark, "通");
+        assert_eq!(chain.hops[1].detail, "有线已连 · Wi-Fi 5 GHz · 信道 36");
+        assert_eq!(chain.problem_id, "");
+        assert!(chain.playbook.is_none());
+
+        r.nic_wifi = false;
+        r.wired_ip = "192.168.1.50".into();
+        r.wired_label = "USB 10/100/1000 LAN".into();
+        r.wired_mbps = 1000;
+        r.mbps = 1000;
+        r.wifi_label = "家里".into();
+        r.noise = -92;
+        r.noise_valid = true;
+        r.tx_mbps = 866;
+        r.rssi = -62;
+        r.rssi_valid = true;
+        let chain = judge(&r);
+        one_nic(&chain);
+        assert_eq!(chain.hops[1].mark, "通");
+        assert_eq!(chain.hops[1].number, 1000);
+        assert_eq!(chain.hops[1].unit, "Mbps");
+        assert_eq!(
+            chain.hops[1].detail,
+            "有线已连 · 192.168.1.50 · USB 10/100/1000 LAN · 1000 Mbps · Wi-Fi 5 GHz · 信道 36 · 家里 · 噪声 -92 · 信号 -62 · 866 Mbps"
+        );
+    }
+
+    #[test]
+    fn both_links_down_stay_one_segment() {
+        let mut r = healthy();
+        r.nic_up = false;
+        r.wifi_up = false;
+        r.wired_up = false;
+        r.nic_wifi = false;
+        r.gw_replied = false;
+        r.gw_loss = 100.0;
+        let chain = judge(&r);
+        one_nic(&chain);
+        assert_eq!(chain.hops[1].mark, "断");
+        assert_eq!(chain.hops[1].detail, "没有拿到地址");
+        assert_eq!(chain.problem_id, "nic");
+        assert_eq!(chain.conclusion, "出网断在网卡。");
+        let book = chain.playbook.unwrap();
+        assert_eq!(book.id, "nic-down");
+        assert!(book
+            .look_at
+            .iter()
+            .any(|item| item.contains("Wi-Fi") || item.contains("有线")));
+        assert!(book
+            .never_auto
+            .iter()
+            .all(|item| item.starts_with("不要自动")));
+    }
+
+    #[test]
+    fn wifi_path_stays_slow_when_the_cable_is_also_up() {
+        let mut r = healthy();
+        r.wired_up = true;
+        r.wifi_up = true;
+        r.nic_wifi = true;
+        r.rssi = -80;
+        r.band = "5 GHz".into();
+        r.channel = 36;
+        r.wired_ip = "192.168.1.50".into();
+        r.wired_mbps = 1000;
+        let chain = judge(&r);
+        one_nic(&chain);
+        assert_eq!(chain.hops[1].mark, "慢");
+        assert_eq!(chain.hops[1].number, -80);
+        assert_eq!(chain.hops[1].unit, "dBm");
+        assert!(chain.hops[1].detail.contains("有线已连"));
+        assert!(chain.hops[1].detail.contains("Wi-Fi 5 GHz · 信道 36"));
+        assert_eq!(chain.problem_id, "nic");
+        assert_eq!(chain.conclusion, "出网慢在网卡。");
+        let book = chain.playbook.unwrap();
+        assert_eq!(book.id, "nic-weak");
+        assert!(book.never_auto.iter().any(|item| item.contains("不要自动")));
+    }
+
+    #[test]
+    fn cable_path_stays_slow_when_wifi_is_also_up() {
+        let mut r = healthy();
+        r.wired_up = true;
+        r.wifi_up = true;
+        r.nic_wifi = false;
+        r.wired_mbps = 10;
+        r.mbps = 10;
+        r.rssi = -50;
+        r.band = "2.4 GHz".into();
+        r.channel = 6;
+        let chain = judge(&r);
+        one_nic(&chain);
+        assert_eq!(chain.hops[1].mark, "慢");
+        assert_eq!(chain.hops[1].number, 10);
+        assert_eq!(chain.hops[1].unit, "Mbps");
+        assert!(chain.hops[1].detail.starts_with("有线已连"));
+        assert!(chain.hops[1].detail.contains("Wi-Fi 2.4 GHz · 信道 6"));
+        assert!(chain.hops[1].detail.contains("信号 -50"));
+        assert_eq!(chain.playbook.unwrap().id, "nic-cable");
+    }
+
+    #[test]
+    fn wired_is_not_the_opposite_of_wifi() {
+        let text = "\
+Hardware Port: Wi-Fi
+Device: en0
+Ethernet Address: aa:bb:cc:dd:ee:01
+
+Hardware Port: USB 10/100/1000 LAN
+Device: en7
+Ethernet Address: aa:bb:cc:dd:ee:02
+
+Hardware Port: Thunderbolt Bridge
+Device: bridge0
+Ethernet Address: aa:bb:cc:dd:ee:03
+
+Hardware Port: Thunderbolt Ethernet
+Device: en5
+Ethernet Address: aa:bb:cc:dd:ee:04
+
+Hardware Port: Bluetooth PAN
+Device: en3
+Ethernet Address: aa:bb:cc:dd:ee:05
+";
+        let ports = parse_hardware_ports(text);
+        assert_eq!(
+            ports,
+            vec![
+                ("Wi-Fi".into(), "en0".into()),
+                ("USB 10/100/1000 LAN".into(), "en7".into()),
+                ("Thunderbolt Bridge".into(), "bridge0".into()),
+                ("Thunderbolt Ethernet".into(), "en5".into()),
+                ("Bluetooth PAN".into(), "en3".into()),
+            ]
+        );
+        assert!(is_wired_port("USB 10/100/1000 LAN"));
+        assert!(is_wired_port("Thunderbolt Ethernet"));
+        assert!(!is_wired_port("Wi-Fi"));
+        assert!(!is_wired_port("Thunderbolt Bridge"));
+        assert!(!is_wired_port("Bluetooth PAN"));
+        assert!(!usable_nic_device("bridge0"));
+        assert!(usable_nic_device("en7"));
+        assert!(!usable_nic_device("utun3"));
+
+        let wifi_dump = "\
+en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	status: active
+	inet 192.168.1.20 netmask 0xffffff00 broadcast 192.168.1.255
+";
+        let wired_dump = "\
+en7: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	status: active
+	inet 192.168.1.50 netmask 0xffffff00 broadcast 192.168.1.255
+	media: autoselect (1000baseT <full-duplex>)
+";
+        let snaps = vec![
+            snap_from_dump("Wi-Fi", "en0", wifi_dump),
+            snap_from_dump("USB 10/100/1000 LAN", "en7", wired_dump),
+            snap_from_dump("Thunderbolt Bridge", "bridge0", "status: inactive\n"),
+        ];
+        let wifi = pick_up(&snaps, true, "en7");
+        let wired = pick_up(&snaps, false, "en7");
+        assert_eq!(wifi.map(|snap| snap.device.as_str()), Some("en0"));
+        assert_eq!(wired.map(|snap| snap.ip.as_str()), Some("192.168.1.50"));
+        assert_eq!(wired.map(|snap| snap.mbps), Some(1000));
+        assert!(wifi.is_some() && wired.is_some());
+        assert!(!path_is_wifi(
+            wifi,
+            wired,
+            snaps.iter().find(|snap| snap.device == "en7")
+        ));
+        assert!(path_is_wifi(
+            wifi,
+            wired,
+            snaps.iter().find(|snap| snap.device == "en0")
+        ));
+
+        let wifi_only = vec![snap_from_dump("Wi-Fi", "en0", wifi_dump)];
+        assert!(pick_up(&wifi_only, true, "en0").is_some());
+        assert!(pick_up(&wifi_only, false, "en0").is_none());
+        assert!(path_is_wifi(
+            pick_up(&wifi_only, true, "en0"),
+            None,
+            wifi_only.first()
+        ));
+
+        let wired_only = vec![snap_from_dump("USB 10/100/1000 LAN", "en7", wired_dump)];
+        assert!(pick_up(&wired_only, false, "en7").is_some());
+        assert!(pick_up(&wired_only, true, "en7").is_none());
+        assert!(!path_is_wifi(
+            None,
+            pick_up(&wired_only, false, "en7"),
+            wired_only.first()
+        ));
+
+        let down = "\
+en0: flags=8822<BROADCAST,SMART,SIMPLEX,MULTICAST> mtu 1500
+	status: inactive
+";
+        let neither = vec![
+            snap_from_dump("Wi-Fi", "en0", down),
+            snap_from_dump("USB 10/100/1000 LAN", "en7", down),
+        ];
+        assert!(pick_up(&neither, true, "en0").is_none());
+        assert!(pick_up(&neither, false, "en7").is_none());
+
+        let link_local = "\
+en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	status: active
+	inet 169.254.10.20 netmask 0xffff0000 broadcast 169.254.255.255
+";
+        let local = vec![
+            snap_from_dump("Wi-Fi", "en0", link_local),
+            snap_from_dump("Ethernet", "en7", link_local),
+        ];
+        assert!(pick_up(&local, true, "en0").is_none());
+        assert!(pick_up(&local, false, "en7").is_none());
+        assert!(local.iter().all(|snap| snap.link_local));
+
+        let pan = snap_from_dump("Bluetooth PAN", "en3", wifi_dump);
+        let cable_wins = vec![
+            pan,
+            snap_from_dump("USB 10/100/1000 LAN", "en7", wired_dump),
+        ];
+        assert_eq!(
+            pick_up(&cable_wins, false, "en3").map(|snap| snap.device.as_str()),
+            Some("en7")
+        );
+        let pan_only = vec![snap_from_dump("Bluetooth PAN", "en3", wifi_dump)];
+        assert_eq!(
+            pick_up(&pan_only, false, "en3").map(|snap| snap.port.as_str()),
+            Some("Bluetooth PAN")
+        );
     }
 
     #[test]
