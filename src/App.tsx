@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
+import { QUICK_SITES, chipSelected, quickHost } from './sites'
 
 type Hop = {
   id: string
@@ -268,30 +269,54 @@ export default function App() {
                       {chain.wan.https}
                     </p>
                   ) : null}
-                  <input
-                    className="note site"
-                    value={site}
-                    maxLength={253}
-                    placeholder="打不开的网址"
-                    aria-label="要核对证书的网址"
-                    autoComplete="off"
-                    spellCheck={false}
-                    onChange={(event) => setSite(event.target.value)}
-                    onBlur={(event) => {
-                      const next = event.currentTarget.value.trim()
-                      const changed = next !== siteRef.current
-                      const button = (event.relatedTarget as HTMLElement | null)?.id === 'again'
-                      rememberSite(event.currentTarget.value)
-                      if (changed && !button) void run(true)
-                    }}
-                    onKeyDown={(event) => {
-                      if (event.key !== 'Enter') return
-                      event.preventDefault()
-                      rememberSite(event.currentTarget.value)
-                      event.currentTarget.blur()
-                      void run(true)
-                    }}
-                  />
+                  <div className="site-row">
+                    <input
+                      className="note site"
+                      value={site}
+                      maxLength={253}
+                      placeholder="打不开的网址"
+                      aria-label="要核对证书的网址"
+                      autoComplete="off"
+                      spellCheck={false}
+                      onChange={(event) => setSite(event.target.value)}
+                      onBlur={(event) => {
+                        const next = event.currentTarget.value.trim()
+                        const changed = next !== siteRef.current
+                        const related = event.relatedTarget as HTMLElement | null
+                        const button =
+                          related?.id === 'again' || related?.dataset.quickSite === 'true'
+                        rememberSite(event.currentTarget.value)
+                        if (changed && !button) void run(true)
+                      }}
+                      onKeyDown={(event) => {
+                        if (event.key !== 'Enter') return
+                        event.preventDefault()
+                        rememberSite(event.currentTarget.value)
+                        event.currentTarget.blur()
+                        void run(true)
+                      }}
+                    />
+                    <div className="sites" role="group" aria-label="常用网址">
+                      {QUICK_SITES.map((item) => (
+                        <button
+                          key={item.host}
+                          type="button"
+                          className="chip"
+                          data-quick-site="true"
+                          aria-pressed={chipSelected(site, item.host)}
+                          disabled={dim}
+                          onClick={() => {
+                            const host = quickHost(item.host)
+                            if (!host) return
+                            rememberSite(host)
+                            void run(true)
+                          }}
+                        >
+                          {item.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
                 </div>
               ) : null}
               {problem ? (

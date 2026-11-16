@@ -1,7 +1,8 @@
-//! Facts for the 外网 segment: hop loss and latency, ASN, NAT, and HTTPS.
+//! Facts for the 外网 segment: hop loss and latency, ASN, NAT, HTTPS, and redirects.
 //!
 //! The playbook is text a person can read. Nothing in it is executed.
-//! The app does not change DNS, proxy settings, routes, trust stores, or power.
+//! Redirects are counted and described. They are not followed in order to change
+//! DNS, proxy settings, routes, trust stores, or power.
 
 use serde::Serialize;
 use std::collections::HashMap;
@@ -123,6 +124,74 @@ const BOOKS: &[Book] = &[
             "不要自动改系统时间",
         ],
     },
+    Book {
+        id: "wan-portal",
+        look_at: &["是不是门户认证", "证书那一行怎么写跳转", "外网是通还是断"],
+        check_first: "这一页在跳转。先看是不是门户认证。",
+        never_auto: &["不要自动关掉系统代理", "不要自动改网络", "不要自动信任证书"],
+    },
+    Book {
+        id: "nic-down",
+        look_at: &["网卡这一行有没有地址", "是 Wi-Fi 还是有线"],
+        check_first: "网卡没有地址。先看线或者 Wi-Fi 有没有连上。",
+        never_auto: &["不要自动改 DNS", "不要自动关掉系统代理", "不要自动重启光猫"],
+    },
+    Book {
+        id: "nic-address",
+        look_at: &["这一行是不是没有拿到地址", "路由器有没有在发地址"],
+        check_first: "路由器没有发地址。先看网卡连上没有。",
+        never_auto: &["不要自动改 DNS", "不要自动关掉系统代理", "不要自动重启光猫"],
+    },
+    Book {
+        id: "nic-weak",
+        look_at: &["信号这一格", "频段和信道"],
+        check_first: "信号偏弱。先看离路由器有多远，以及信道。",
+        never_auto: &["不要自动改信道", "不要自动改 DNS", "不要自动重启光猫"],
+    },
+    Book {
+        id: "nic-air",
+        look_at: &["噪声和速率", "频段和信道"],
+        check_first: "无线链路质量差。先看噪声和信道。",
+        never_auto: &["不要自动改信道", "不要自动关掉系统代理", "不要自动重启光猫"],
+    },
+    Book {
+        id: "nic-cable",
+        look_at: &["协商速率", "网线那一头"],
+        check_first: "网卡速率偏低。先看网线和交换机端口。",
+        never_auto: &["不要自动改 DNS", "不要自动关掉系统代理", "不要自动重启光猫"],
+    },
+    Book {
+        id: "dns-down",
+        look_at: &["正在用的 DNS", "这一行是没有解析，还是没有配置"],
+        check_first: "DNS 没有解析。先看服务器地址，不要先改成别的。",
+        never_auto: &[
+            "不要自动把 DNS 改成 223.5.5.5",
+            "不要自动关掉系统代理",
+            "不要自动重启光猫",
+        ],
+    },
+    Book {
+        id: "dns-slow",
+        look_at: &["解析用了多久", "正在用哪一台 DNS"],
+        check_first: "DNS 偏慢。先看这一次的时间，过一会儿再测。",
+        never_auto: &[
+            "不要自动把 DNS 改成 223.5.5.5",
+            "不要自动关掉系统代理",
+            "不要自动重启路由器",
+        ],
+    },
+    Book {
+        id: "proxy-down",
+        look_at: &["系统代理开着没有", "这一行的地址在不在听"],
+        check_first: "代理挡在路上。先看它在不在听。",
+        never_auto: &["不要自动关掉系统代理", "不要自动改 DNS", "不要自动重启光猫"],
+    },
+    Book {
+        id: "proxy-slow",
+        look_at: &["代理这一段的时间", "比直连慢多少"],
+        check_first: "代理在拖时间。先看这一段的毫秒。",
+        never_auto: &["不要自动关掉系统代理", "不要自动改 DNS", "不要自动换节点"],
+    },
 ];
 
 pub fn playbook(id: &str) -> Playbook {
@@ -145,9 +214,147 @@ fn with_book(id: &str, conclusion: Option<&str>, highlight: bool) -> Advice {
     }
 }
 
+/// Six or more hops is the same threshold the sheet treats as an abnormal chain.
+/// A normal site often redirects once or twice. A captive portal is called out
+/// even when it only redirects once.
+pub const REDIRECT_NOTABLE: u32 = 6;
+const REDIRECT_CAP: usize = 6;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RedirectFact {
+    pub count: u32,
+    pub portal: bool,
+}
+
+impl RedirectFact {
+    pub fn none() -> Self {
+        Self {
+            count: 0,
+            portal: false,
+        }
+    }
+
+    pub fn notable(self) -> bool {
+        self.portal || self.count >= REDIRECT_NOTABLE
+    }
+
+    pub fn words(self) -> Option<String> {
+        if !self.notable() {
+            return None;
+        }
+        let mut parts = Vec::new();
+        if self.count >= REDIRECT_NOTABLE {
+            parts.push(format!("跳了 {} 次", self.count));
+        }
+        if self.portal {
+            parts.push("像门户认证".to_string());
+        }
+        Some(parts.join(" · "))
+    }
+}
+
+/// Attach the redirect fact to the certificate line. The URL itself is not copied.
+pub fn https_with_redirect(line: &str, fact: RedirectFact) -> String {
+    if line.is_empty() {
+        return String::new();
+    }
+    match fact.words() {
+        Some(words) => format!("{line} · {words}"),
+        None => line.to_string(),
+    }
+}
+
+pub fn redirect_fact(host: &str, urls: &[String]) -> RedirectFact {
+    let mut count = 0u32;
+    let mut portal = false;
+    for url in urls {
+        let Some(url) = safe_redirect(url) else {
+            continue;
+        };
+        count = count.saturating_add(1);
+        if looks_like_portal(host, &url) {
+            portal = true;
+        }
+    }
+    RedirectFact { count, portal }
+}
+
+fn portal_ip(ip: Ipv4Addr) -> bool {
+    if ip.is_loopback() {
+        return true;
+    }
+    let [a, b, _, _] = ip.octets();
+    let private = a == 10 || (a == 172 && (16..=31).contains(&b)) || (a == 192 && b == 168);
+    let link_local = a == 169 && b == 254;
+    let cgnat = a == 100 && (64..=127).contains(&b);
+    private || link_local || cgnat
+}
+
+fn looks_like_portal(requested: &str, url: &str) -> bool {
+    let Some(host) = site_host(url) else {
+        return false;
+    };
+    let requested = requested.trim().trim_end_matches('.').to_ascii_lowercase();
+    if host == requested {
+        return false;
+    }
+    if let Ok(ip) = host.parse::<Ipv4Addr>() {
+        return portal_ip(ip);
+    }
+    let url_l = url.to_ascii_lowercase();
+    ["portal", "captive", "hotspot", "wifidog", "nodogsplash"]
+        .iter()
+        .any(|hint| url_l.contains(hint))
+}
+
+/// A redirect target the probe is willing to request next. Flags and other schemes are refused.
+pub fn safe_redirect(url: &str) -> Option<String> {
+    let url = url.trim();
+    if url.is_empty()
+        || url.len() > 512
+        || url.starts_with('-')
+        || url.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
+        return None;
+    }
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return None;
+    }
+    site_host(url)?;
+    Some(url.to_string())
+}
+
 /// Pick the sentence under the card. Certificate advice is used only when the
 /// path itself is up; a dead path stays a connectivity result.
-pub fn advise(mark: &str, https_kind: &str, dest_loss: f64) -> Advice {
+/// A redirect fact does not change the path mark. It only changes the sentence.
+pub fn advise(mark: &str, https_kind: &str, dest_loss: f64, redirect: RedirectFact) -> Advice {
+    let mut advice = advise_path(mark, https_kind, dest_loss);
+    if !redirect.notable() {
+        return advice;
+    }
+    // A slow or broken path keeps that conclusion. Certificate and handshake
+    // problems can be the portal's, so those sentences name the jump first.
+    let replace = advice.playbook.is_none() || matches!(https_kind, "cert" | "tls");
+    if mark != "断" && replace {
+        let conclusion = match (mark, https_kind) {
+            ("慢", "cert") => "外网偏慢。这一页在跳转，证书也不合格。",
+            (_, "cert") => "外网是通的。这一页在跳转，证书也不合格。",
+            ("慢", "tls") => "外网偏慢。这一页在跳转，加密握手也没完成。",
+            (_, "tls") => "外网是通的。这一页在跳转，加密握手也没完成。",
+            ("慢", _) => "外网偏慢。这一页在跳转。",
+            _ => "外网是通的。这一页在跳转。",
+        };
+        return with_book("wan-portal", Some(conclusion), true);
+    }
+    if let Some(book) = advice.playbook.as_mut() {
+        if !book.look_at.iter().any(|item| item.contains("门户")) {
+            book.look_at.insert(0, "是不是门户认证".to_string());
+        }
+    }
+    advice
+}
+
+fn advise_path(mark: &str, https_kind: &str, dest_loss: f64) -> Advice {
     let path_up = mark != "断";
     if path_up && https_kind == "cert" {
         let conclusion = if mark == "慢" {
@@ -376,6 +583,8 @@ pub struct HttpsRaw {
     pub connect_ms: i64,
     pub app_ms: i64,
     pub stderr: String,
+    /// The next URL from this one response. Empty when the server did not redirect.
+    pub redirect_url: String,
 }
 
 impl HttpsRaw {
@@ -386,6 +595,7 @@ impl HttpsRaw {
             connect_ms: 0,
             app_ms: 0,
             stderr: String::new(),
+            redirect_url: String::new(),
         }
     }
 }
@@ -661,7 +871,7 @@ pub fn https_args(host: &str, proxy: Option<&str>) -> Option<Vec<String>> {
         "--proto".to_string(),
         "=https".to_string(),
         "-w".to_string(),
-        "verify=%{ssl_verify_result}\nconnect=%{time_connect}\napp=%{time_appconnect}\n"
+        "verify=%{ssl_verify_result}\nconnect=%{time_connect}\napp=%{time_appconnect}\nredirect=%{redirect_url}\n"
             .to_string(),
     ];
     if let Some(proxy) = proxy {
@@ -700,7 +910,75 @@ pub fn https_probe(host: &str, proxy: Option<&str>) -> HttpsRaw {
         connect_ms,
         app_ms,
         stderr,
+        redirect_url: parse_redirect_target(&stdout),
     }
+}
+
+pub fn parse_redirect_target(stdout: &str) -> String {
+    for line in stdout.lines() {
+        if let Some(value) = line.trim().strip_prefix("redirect=") {
+            return value.trim().to_string();
+        }
+    }
+    String::new()
+}
+
+/// Follow Location one hop at a time, up to [`REDIRECT_CAP`], and return the targets.
+/// Each request uses `--max-redirs 0` so curl does not hide the chain.
+/// Certificate verification is left on. A hop that fails TLS stops the walk.
+pub fn follow_redirects(first_url: &str, proxy: Option<&str>) -> Vec<String> {
+    let Some(first) = safe_redirect(first_url) else {
+        return Vec::new();
+    };
+    let mut urls = vec![first];
+    while urls.len() < REDIRECT_CAP {
+        let Some(next) = next_redirect(urls.last().unwrap(), proxy) else {
+            break;
+        };
+        let looped = urls.iter().any(|url| url == &next);
+        urls.push(next);
+        if looped {
+            break;
+        }
+    }
+    urls
+}
+
+fn next_redirect(url: &str, proxy: Option<&str>) -> Option<String> {
+    let args = redirect_args(url, proxy)?;
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (stdout, _) = run_bounded("curl", &refs, Duration::from_secs(4))?;
+    safe_redirect(&parse_redirect_target(&stdout))
+}
+
+fn redirect_args(url: &str, proxy: Option<&str>) -> Option<Vec<String>> {
+    let url = safe_redirect(url)?;
+    let mut args = vec![
+        "-sS".to_string(),
+        "-o".to_string(),
+        "/dev/null".to_string(),
+        "--connect-timeout".to_string(),
+        "2".to_string(),
+        "--max-time".to_string(),
+        "3".to_string(),
+        "--max-redirs".to_string(),
+        "0".to_string(),
+        "--proto".to_string(),
+        "=http,https".to_string(),
+        "--proto-redir".to_string(),
+        "-all,http,https".to_string(),
+        "-w".to_string(),
+        "redirect=%{redirect_url}".to_string(),
+    ];
+    if let Some(proxy) = proxy {
+        if proxy_ok(proxy) {
+            args.push("-x".to_string());
+            args.push(proxy.to_string());
+        }
+    }
+    args.push("--url".to_string());
+    args.push(url);
+    Some(args)
 }
 
 pub fn parse_traceroute(text: &str) -> Vec<ProbeHop> {
@@ -1376,6 +1654,7 @@ traceroute to 1.1.1.1 (1.1.1.1), 6 hops max, 52 byte packets
             connect_ms: 30,
             app_ms: 0,
             stderr: "curl: (60) SSL certificate problem: certificate has expired".into(),
+            redirect_url: String::new(),
         };
         let (kind, line) = classify_https("shop.example", false, &expired, NameLookup::Found);
         assert_eq!(kind, "cert");
@@ -1387,6 +1666,7 @@ traceroute to 1.1.1.1 (1.1.1.1), 6 hops max, 52 byte packets
             connect_ms: 0,
             app_ms: 0,
             stderr: "curl: (28) Timeout was reached".into(),
+            redirect_url: String::new(),
         };
         let (kind, line) = classify_https("shop.example", false, &timed_out, NameLookup::Found);
         assert_eq!(kind, "down");
@@ -1399,6 +1679,7 @@ traceroute to 1.1.1.1 (1.1.1.1), 6 hops max, 52 byte packets
             connect_ms: 0,
             app_ms: 0,
             stderr: "curl: (6) Could not resolve host: shop.example".into(),
+            redirect_url: String::new(),
         };
         assert_eq!(
             classify_https("shop.example", false, &unresolved, NameLookup::Unchecked).1,
@@ -1411,6 +1692,7 @@ traceroute to 1.1.1.1 (1.1.1.1), 6 hops max, 52 byte packets
             connect_ms: 27,
             app_ms: 0,
             stderr: "SSL: no alternative certificate subject name matches target host name".into(),
+            redirect_url: String::new(),
         };
         assert_eq!(
             classify_https("wrong.host.example", false, &mismatch, NameLookup::Found).1,
@@ -1423,6 +1705,7 @@ traceroute to 1.1.1.1 (1.1.1.1), 6 hops max, 52 byte packets
             connect_ms: 4,
             app_ms: 20,
             stderr: String::new(),
+            redirect_url: String::new(),
         };
         let (kind, line) = classify_https("www.baidu.com", true, &trusted, NameLookup::Found);
         assert_eq!(kind, "ok");
@@ -1434,6 +1717,7 @@ traceroute to 1.1.1.1 (1.1.1.1), 6 hops max, 52 byte packets
             connect_ms: 15,
             app_ms: 0,
             stderr: "curl: (35) TLS connect error".into(),
+            redirect_url: String::new(),
         };
         assert_eq!(
             classify_https("a.example", false, &handshake, NameLookup::Found).0,
@@ -1445,6 +1729,10 @@ traceroute to 1.1.1.1 (1.1.1.1), 6 hops max, 52 byte packets
     fn https_probe_does_not_skip_verification() {
         let args = https_args("Example.COM", Some("http://127.0.0.1:8080")).unwrap();
         assert!(!args.iter().any(|arg| arg == "-k" || arg == "--insecure"));
+        assert!(!args.iter().any(|arg| arg == "-L" || arg == "--location"));
+        assert!(args
+            .iter()
+            .any(|arg| arg.contains("redirect=%{redirect_url}")));
         assert!(args.iter().any(|arg| arg == "https://example.com/"));
         assert!(args.iter().any(|arg| arg == "http://127.0.0.1:8080"));
         assert!(https_args("-k", None).is_none());
@@ -1515,7 +1803,8 @@ traceroute to 1.1.1.1 (1.1.1.1), 6 hops max, 52 byte packets
 
     #[test]
     fn advice_keeps_a_certificate_apart_from_a_dead_path() {
-        let dead = advise("断", "down", -1.0);
+        let quiet = RedirectFact::none();
+        let dead = advise("断", "down", -1.0, quiet);
         assert!(!dead.highlight);
         assert!(dead.conclusion.is_none());
         assert!(dead.next.unwrap().contains("不是证书问题"));
@@ -1526,7 +1815,7 @@ traceroute to 1.1.1.1 (1.1.1.1), 6 hops max, 52 byte packets
             .iter()
             .any(|line| line.contains("不要自动重启光猫")));
 
-        let cert = advise("通", "cert", 0.0);
+        let cert = advise("通", "cert", 0.0, quiet);
         assert!(cert.highlight);
         assert_eq!(
             cert.conclusion.as_deref(),
@@ -1537,27 +1826,151 @@ traceroute to 1.1.1.1 (1.1.1.1), 6 hops max, 52 byte packets
         assert!(book.never_auto.iter().any(|line| line.contains("信任")));
         assert!(!book.check_first.contains("重启光猫"));
 
-        let site = advise("通", "down", -1.0);
+        let site = advise("通", "down", -1.0, quiet);
         assert_eq!(
             site.conclusion.as_deref(),
             Some("外网是通的。这个网址连不上。")
         );
         assert!(!site.conclusion.unwrap().contains("证书问题"));
 
-        let loss = advise("慢", "ok", 33.0);
+        let loss = advise("慢", "ok", 33.0, quiet);
         assert_eq!(loss.playbook.unwrap().id, "wan-loss");
         assert!(!loss.highlight);
 
-        let slow = advise("慢", "", -1.0);
+        let slow = advise("慢", "", -1.0, quiet);
         assert_eq!(slow.playbook.unwrap().id, "wan-slow");
 
-        assert!(advise("通", "ok", 0.0).playbook.is_none());
+        assert!(advise("通", "ok", 0.0, quiet).playbook.is_none());
+    }
+
+    #[test]
+    fn quick_sites_are_ordinary_hostnames_and_the_default_stays_baidu() {
+        assert_eq!(resolve_site("").unwrap(), HTTPS_SAMPLE);
+        assert_eq!(HTTPS_SAMPLE, "www.baidu.com");
+        for host in ["www.baidu.com", "www.taobao.com", "www.qq.com"] {
+            assert_eq!(resolve_site(host).unwrap(), host);
+        }
+        // Typed by hand it is still just a hostname. It is not a chip.
+        assert_eq!(resolve_site("www.google.com").unwrap(), "www.google.com");
+    }
+
+    #[test]
+    fn redirects_are_words_on_the_certificate_line_and_do_not_become_actions() {
+        let ordinary = redirect_fact("www.baidu.com", &["https://www.baidu.com/".to_string()]);
+        assert!(!ordinary.notable());
+        assert_eq!(
+            https_with_redirect("www.baidu.com · 证书正常", ordinary),
+            "www.baidu.com · 证书正常"
+        );
+
+        let mut many = Vec::new();
+        for n in 1..=5 {
+            many.push(format!("https://www.baidu.com/{n}"));
+        }
+        let five = redirect_fact("www.baidu.com", &many);
+        assert!(!five.notable());
+        many.push("https://www.baidu.com/6".to_string());
+        let six = redirect_fact("www.baidu.com", &many);
+        assert!(six.notable());
+        assert!(!six.portal);
+        let line = https_with_redirect("www.baidu.com · 证书正常", six);
+        assert_eq!(line, "www.baidu.com · 证书正常 · 跳了 6 次");
+        let advice = advise("通", "ok", 0.0, six);
+        assert_eq!(advice.playbook.as_ref().unwrap().id, "wan-portal");
+        assert_eq!(
+            advice.playbook.as_ref().unwrap().look_at[0],
+            "是不是门户认证"
+        );
+        assert!(advice
+            .playbook
+            .unwrap()
+            .never_auto
+            .iter()
+            .any(|item| item.contains("不要自动关掉系统代理")));
+        assert!(!advice_text_runs_a_change(&advise("通", "ok", 0.0, six)));
+        let slow = advise("慢", "ok", 33.0, six);
+        assert_eq!(slow.playbook.as_ref().unwrap().id, "wan-loss");
+        assert_eq!(slow.playbook.as_ref().unwrap().look_at[0], "是不是门户认证");
+        assert!(slow.conclusion.is_none());
+
+        let portal = redirect_fact(
+            "www.baidu.com",
+            &["http://192.168.1.1/login?token=secret".to_string()],
+        );
+        assert!(portal.portal);
+        assert_eq!(portal.count, 1);
+        let line = https_with_redirect("www.baidu.com · 证书正常", portal);
+        assert_eq!(line, "www.baidu.com · 证书正常 · 像门户认证");
+        assert!(!line.contains("192.168"));
+        assert!(!line.contains("token"));
+        let advice = advise("通", "cert", 0.0, portal);
+        assert_eq!(
+            advice.conclusion.as_deref(),
+            Some("外网是通的。这一页在跳转，证书也不合格。")
+        );
+        let book = advice.playbook.unwrap();
+        assert_eq!(book.look_at[0], "是不是门户认证");
+        assert!(book
+            .never_auto
+            .iter()
+            .any(|item| item.contains("不要自动改网络")));
+        assert!(book
+            .never_auto
+            .iter()
+            .any(|item| item.contains("不要自动信任证书")));
+        assert!(!book.check_first.contains("关掉系统代理"));
+
+        assert!(
+            redirect_fact("www.taobao.com", &["https://m.taobao.com/".to_string()])
+                .words()
+                .is_none()
+        );
+        assert!(
+            redirect_fact(
+                "www.qq.com",
+                &["https://captive.apple.com/hotspot-detect.html".to_string()]
+            )
+            .portal
+        );
+        assert!(safe_redirect("-k").is_none());
+        assert!(safe_redirect("file:///etc/passwd").is_none());
+        assert!(safe_redirect("javascript:alert(1)").is_none());
+
+        let walked = redirect_args("https://www.baidu.com/", None).unwrap();
+        assert!(walked.iter().any(|arg| arg == "--max-redirs"));
+        assert!(walked.iter().any(|arg| arg == "0"));
+        assert!(!walked
+            .iter()
+            .any(|arg| arg == "-L" || arg == "-k" || arg == "--insecure"));
+    }
+
+    fn advice_text_runs_a_change(advice: &Advice) -> bool {
+        let book = advice.playbook.as_ref().unwrap();
+        let next = advice.next.as_deref().unwrap_or("");
+        next.contains("关掉系统代理")
+            || next.contains("改成 223.5.5.5")
+            || book.check_first.contains("改成 223.5.5.5")
     }
 
     #[test]
     fn every_playbook_names_what_to_read_and_what_stays_manual() {
         for id in [
-            "wan-down", "wan-loss", "wan-slow", "wan-cert", "wan-site", "wan-tls",
+            "wan-down",
+            "wan-loss",
+            "wan-slow",
+            "wan-cert",
+            "wan-site",
+            "wan-tls",
+            "wan-portal",
+            "nic-down",
+            "nic-address",
+            "nic-weak",
+            "nic-air",
+            "nic-cable",
+            "dns-down",
+            "dns-slow",
+            "proxy-down",
+            "proxy-slow",
         ] {
             let book = playbook(id);
             assert_eq!(book.id, id);
@@ -1658,6 +2071,7 @@ traceroute to 1.1.1.1 (1.1.1.1), 6 hops max, 52 byte packets
             stderr:
                 "curl: (35) OpenSSL/3.0.13: error:0A000438:SSL routines::tlsv1 alert internal error"
                     .into(),
+            redirect_url: String::new(),
         };
         let (kind, line) = classify_https(host, true, &proxy_alert, NameLookup::Missing);
         assert_eq!(kind, "down");
@@ -1673,6 +2087,7 @@ traceroute to 1.1.1.1 (1.1.1.1), 6 hops max, 52 byte packets
             connect_ms: 20,
             app_ms: 0,
             stderr: "curl: (60) SSL certificate problem: self-signed certificate".into(),
+            redirect_url: String::new(),
         };
         let (kind, line) = classify_https(host, true, &fake_cert, NameLookup::Missing);
         assert_eq!(kind, "down");
@@ -1692,6 +2107,7 @@ traceroute to 1.1.1.1 (1.1.1.1), 6 hops max, 52 byte packets
             connect_ms: 30,
             app_ms: 0,
             stderr: "curl: (60) SSL certificate problem: certificate has expired".into(),
+            redirect_url: String::new(),
         };
         let (kind, line) = classify_https("expired.badssl.com", true, &expired, NameLookup::Found);
         assert_eq!(kind, "cert");

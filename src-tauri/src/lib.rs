@@ -94,6 +94,12 @@ struct Readings {
     nat_line: String,
     https_kind: String,
     https_line: String,
+    band: String,
+    channel: u32,
+    local_proxy_port: u16,
+    clash_mode: String,
+    redirect_count: u32,
+    redirect_portal: bool,
 }
 
 fn hop(id: &str, name: &str, mark: Mark, number: i64, unit: &str, detail: &str) -> Hop {
@@ -175,21 +181,32 @@ fn judge(r: &Readings) -> Chain {
     }
 
     let hops = vec![computer, nic, router, dns, proxy, wan.clone()];
-    let advice = wan::advise(&wan.mark, &r.https_kind, r.dest_loss);
+    let redirect = wan::RedirectFact {
+        count: r.redirect_count,
+        portal: r.redirect_portal,
+    };
+    let advice = wan::advise(&wan.mark, &r.https_kind, r.dest_loss, redirect);
 
     let problem = hops
         .iter()
         .find(|h| h.mark == "断")
         .or_else(|| hops.iter().find(|h| h.mark == "慢"));
-    let (conclusion, next, problem_id) = match problem {
-        Some(h) if h.id != "wan" => (conclusion_for(h), next_for(h), h.id.clone()),
+    let (conclusion, next, problem_id, playbook) = match problem {
+        Some(h) if h.id != "wan" => {
+            let book = segment_book(h);
+            let next = book
+                .as_ref()
+                .map(|item| item.check_first.clone())
+                .unwrap_or_else(|| next_for(h));
+            (conclusion_for(h), next, h.id.clone(), book)
+        }
         Some(_) => {
             let conclusion = advice
                 .conclusion
                 .clone()
                 .unwrap_or_else(|| conclusion_for(&wan));
             let next = advice.next.clone().unwrap_or_else(|| next_for(&wan));
-            (conclusion, next, "wan".to_string())
+            (conclusion, next, "wan".to_string(), advice.playbook)
         }
         None if advice.highlight => {
             let conclusion = advice
@@ -200,15 +217,15 @@ fn judge(r: &Readings) -> Chain {
                 .next
                 .clone()
                 .unwrap_or_else(|| "不用做什么。".to_string());
-            (conclusion, next, "wan".to_string())
+            (conclusion, next, "wan".to_string(), advice.playbook)
         }
         None => (
             "从这台电脑到外网是通的。".to_string(),
             "不用做什么。".to_string(),
             String::new(),
+            None,
         ),
     };
-    let show_book = problem_id == "wan";
 
     Chain {
         hops,
@@ -218,7 +235,7 @@ fn judge(r: &Readings) -> Chain {
         wan: wan::WanCard {
             hops: r.wan_hops.clone(),
             nat: r.nat_line.clone(),
-            https: r.https_line.clone(),
+            https: wan::https_with_redirect(&r.https_line, redirect),
             https_kind: r.https_kind.clone(),
             path: if r.proxy_on && r.wan_traced {
                 "直连".to_string()
@@ -226,7 +243,7 @@ fn judge(r: &Readings) -> Chain {
                 String::new()
             },
         },
-        playbook: if show_book { advice.playbook } else { None },
+        playbook,
     }
 }
 
@@ -407,6 +424,12 @@ fn nic_detail(r: &Readings) -> String {
     } else {
         format!("{} · {kind}", r.nic_ip)
     };
+    if r.nic_wifi {
+        let radio = band_channel(&r.band, r.channel);
+        if !radio.is_empty() {
+            line = format!("{line} · {radio}");
+        }
+    }
     if r.nic_wifi && r.noise_valid && r.noise < 0 {
         line = format!("{line} · 噪声 {}", r.noise);
     }
@@ -444,6 +467,13 @@ fn dns_detail(r: &Readings) -> String {
 
 fn proxy_detail(r: &Readings) -> String {
     if !r.proxy_on {
+        if r.local_proxy_port > 0 {
+            let mut line = format!("系统代理关着，本机 {} 在听", r.local_proxy_port);
+            if !r.clash_mode.is_empty() {
+                line = format!("{line} · {}", r.clash_mode);
+            }
+            return line;
+        }
         return "直连".to_string();
     }
     let addr = if r.proxy_address.is_empty() {
@@ -451,13 +481,18 @@ fn proxy_detail(r: &Readings) -> String {
     } else {
         r.proxy_address.clone()
     };
-    if !r.proxy_accepting {
-        return format!("{addr} 没有在听");
+    let line = if !r.proxy_accepting {
+        format!("{addr} 没有在听")
+    } else if r.via_tested && !r.via_ok && r.direct_ok {
+        format!("{addr} 没有把流量送出去")
+    } else {
+        addr
+    };
+    if r.clash_mode.is_empty() {
+        line
+    } else {
+        format!("{line} · {}", r.clash_mode)
     }
-    if r.via_tested && !r.via_ok && r.direct_ok {
-        return format!("{addr} 没有把流量送出去");
-    }
-    addr
 }
 
 fn wan_detail(r: &Readings) -> String {
@@ -485,6 +520,22 @@ fn conclusion_for(hop: &Hop) -> String {
     format!("出网{verb}在{name}。")
 }
 
+fn segment_book(hop: &Hop) -> Option<wan::Playbook> {
+    let id = match hop.id.as_str() {
+        "nic" if hop.detail.contains("没有从路由器拿到地址") => "nic-address",
+        "nic" if hop.mark == "断" => "nic-down",
+        "nic" if hop.unit == "Mbps" => "nic-cable",
+        "nic" if hop.mark == "慢" && hop.unit == "dBm" && hop.number <= -75 => "nic-weak",
+        "nic" if hop.mark == "慢" => "nic-air",
+        "dns" if hop.mark == "断" => "dns-down",
+        "dns" if hop.mark == "慢" => "dns-slow",
+        "proxy" if hop.mark == "断" => "proxy-down",
+        "proxy" if hop.mark == "慢" => "proxy-slow",
+        _ => return None,
+    };
+    Some(wan::playbook(id))
+}
+
 fn next_for(hop: &Hop) -> String {
     if hop.id == "computer" && hop.detail.contains("两块网卡") {
         return "本机地址和另一台设备撞了。改掉重复的地址后再测。".to_string();
@@ -495,8 +546,8 @@ fn next_for(hop: &Hop) -> String {
     if hop.detail.contains("硬件地址变了") {
         return "网关的设备变了。等它稳定，或重启路由器后再测。".to_string();
     }
-    if hop.detail.contains("没有从路由器拿到地址") {
-        return "路由器没有发地址。重新连接后再测。".to_string();
+    if let Some(book) = segment_book(hop) {
+        return book.check_first;
     }
     if hop.id == "computer"
         && hop.mark == "慢"
@@ -504,24 +555,11 @@ fn next_for(hop: &Hop) -> String {
     {
         return "这台电脑正在占带宽。先停掉正在下载的程序后再测。".to_string();
     }
-    if hop.id == "nic" && hop.mark == "慢" && hop.unit == "dBm" && hop.number > -75 {
-        return "无线链路质量差。换一个信道，或靠近路由器。".to_string();
-    }
-    if hop.id == "nic" && hop.mark == "慢" && hop.unit.is_empty() && hop.detail.contains("Mbps") {
-        return "无线链路质量差。换一个信道，或靠近路由器。".to_string();
-    }
     match (hop.id.as_str(), hop.mark.as_str(), hop.unit.as_str()) {
         ("computer", "断", _) => "网络栈没有回应。重启这台电脑后再测。",
         ("computer", _, _) => "这台电脑自己在拖时间。关掉占满系统的程序后再测。",
-        ("nic", "断", _) => "网卡没有地址。重新连接 Wi-Fi，或把网线插上。",
-        ("nic", _, "Mbps") => "网卡速率偏低。换一根线，或检查交换机端口。",
-        ("nic", _, _) => "信号偏弱。靠近路由器，或改用网线。",
         ("router", "断", _) => "路由器没有回应。看一下它是否通电，或重启路由器。",
         ("router", _, _) => "路由器回应慢。重启一次路由器。",
-        ("dns", "断", _) => "DNS 没有解析。改成 223.5.5.5 后再测。",
-        ("dns", _, _) => "DNS 偏慢。换成 223.5.5.5 后再测。",
-        ("proxy", "断", _) => "代理挡在路上。关掉系统代理，或重新打开代理软件。",
-        ("proxy", _, _) => "代理在拖时间。换一个节点，或先改成直连。",
         ("wan", "断", _) => "前面都过了，外网没有回应。重启光猫，或过几分钟再测。",
         _ => "外网本身慢。过几分钟再测。",
     }
@@ -962,19 +1000,99 @@ struct ProxyPath {
     connect_ms: i64,
     kind: String,
     address: String,
+    /// A common local proxy port that is listening while the system proxy is off.
+    local_port: u16,
+    clash_mode: String,
+}
+
+fn proxy_closed() -> ProxyPath {
+    ProxyPath {
+        on: false,
+        accepting: false,
+        connect_ms: 0,
+        kind: String::new(),
+        address: String::new(),
+        local_port: 0,
+        clash_mode: String::new(),
+    }
+}
+
+/// Ports seen on Clash, V2Ray, and the local listeners this sheet already knows.
+const LOCAL_PROXY_PORTS: &[u16] = &[7897, 7890, 7893, 1080, 1087, 20171];
+const CLASH_API_PORTS: &[u16] = &[9090, 9097];
+
+fn find_local_proxy_port() -> Option<u16> {
+    let open = std::thread::scope(|scope| {
+        let handles: Vec<_> = LOCAL_PROXY_PORTS
+            .iter()
+            .copied()
+            .map(|port| scope.spawn(move || port_listening(port)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap_or(false))
+            .collect::<Vec<_>>()
+    });
+    LOCAL_PROXY_PORTS
+        .iter()
+        .copied()
+        .zip(open)
+        .find(|(_, listening)| *listening)
+        .map(|(port, _)| port)
+}
+
+fn clash_mode_from_body(text: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(text.trim()).ok()?;
+    match value.get("mode").and_then(|item| item.as_str())? {
+        "rule" => Some("规则模式".to_string()),
+        "global" => Some("全局模式".to_string()),
+        "direct" => Some("直连模式".to_string()),
+        _ => None,
+    }
+}
+
+/// Read only the mode field from the local Clash API. The rest of the body is dropped.
+fn clash_mode() -> String {
+    let bodies = std::thread::scope(|scope| {
+        let handles: Vec<_> = CLASH_API_PORTS
+            .iter()
+            .copied()
+            .map(|port| {
+                scope.spawn(move || {
+                    let url = format!("http://127.0.0.1:{port}/configs");
+                    let mut cmd = curl_cmd();
+                    cmd.args(["-s", "--max-time", "1", "--noproxy", "*", &url]);
+                    cmd.output()
+                        .ok()
+                        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+                        .unwrap_or_default()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap_or_default())
+            .collect::<Vec<_>>()
+    });
+    for body in bodies {
+        if let Some(mode) = clash_mode_from_body(&body) {
+            return mode;
+        }
+    }
+    String::new()
 }
 
 fn inspect_proxy_path() -> ProxyPath {
     let (iface, _) = get_primary_interface();
     let service = hardware_port_for(&iface);
     let Some((host, port, kind)) = system_proxy(&service) else {
-        return ProxyPath {
-            on: false,
-            accepting: false,
-            connect_ms: 0,
-            kind: String::new(),
-            address: String::new(),
-        };
+        let local_port = find_local_proxy_port().unwrap_or(0);
+        let mut closed = proxy_closed();
+        if local_port > 0 {
+            closed.local_port = local_port;
+            closed.clash_mode = clash_mode();
+        }
+        return closed;
     };
     let connect_ms = connect_host_ms(&host, port).unwrap_or(0);
     let accepting = if is_loopback(&host) {
@@ -988,6 +1106,8 @@ fn inspect_proxy_path() -> ProxyPath {
         connect_ms,
         kind: kind.to_string(),
         address: format!("{host}:{port}"),
+        local_port: 0,
+        clash_mode: clash_mode(),
     }
 }
 
@@ -1045,6 +1165,35 @@ struct Radio {
     noise_valid: bool,
     noise: i32,
     tx_mbps: i64,
+    band: String,
+    channel: u32,
+}
+
+fn band_label(raw: &str) -> String {
+    let compact: String = raw.chars().filter(|c| !c.is_whitespace()).collect();
+    match compact.to_ascii_lowercase().as_str() {
+        "2.4ghz" => "2.4 GHz".to_string(),
+        "5ghz" => "5 GHz".to_string(),
+        "6ghz" => "6 GHz".to_string(),
+        _ => String::new(),
+    }
+}
+
+fn band_channel(band: &str, channel: u32) -> String {
+    match (band.is_empty(), channel == 0) {
+        (true, true) => String::new(),
+        (false, false) => format!("{band} · 信道 {channel}"),
+        (false, true) => band.to_string(),
+        (true, false) => format!("信道 {channel}"),
+    }
+}
+
+fn wifi_channel(raw: u64) -> u32 {
+    if (1..=233).contains(&raw) {
+        raw as u32
+    } else {
+        0
+    }
 }
 
 fn tx_mbps_from(raw: i64) -> i64 {
@@ -1063,18 +1212,38 @@ fn radio_from_json(v: &serde_json::Value) -> Option<Radio> {
         .get("rssiValid")
         .and_then(|x| x.as_bool())
         .unwrap_or(false);
-    if !valid || rssi >= 0 {
-        return None;
-    }
     let noise = v.get("noise").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
     let tx = v.get("txRate").and_then(|x| x.as_i64()).unwrap_or(0);
+    let channel = wifi_channel(v.get("channel").and_then(|x| x.as_u64()).unwrap_or(0));
+    let band = band_label(v.get("band").and_then(|x| x.as_str()).unwrap_or(""));
+    let rssi_valid = valid && rssi < 0;
+    if !rssi_valid && channel == 0 && band.is_empty() {
+        return None;
+    }
     Some(Radio {
-        rssi_valid: true,
-        rssi,
-        noise_valid: noise < 0,
-        noise,
-        tx_mbps: tx_mbps_from(tx),
+        rssi_valid,
+        rssi: if rssi_valid { rssi } else { 0 },
+        noise_valid: rssi_valid && noise < 0,
+        noise: if rssi_valid { noise } else { 0 },
+        tx_mbps: if rssi_valid { tx_mbps_from(tx) } else { 0 },
+        band,
+        channel,
     })
+}
+
+fn airport_channel(text: &str) -> u32 {
+    let raw = text
+        .lines()
+        .find(|line| line.trim().starts_with("channel:"))
+        .and_then(|line| line.split(':').nth(1))
+        .and_then(|value| {
+            value
+                .split([',', ' '])
+                .find(|part| !part.trim().is_empty())
+                .and_then(|part| part.trim().parse::<u64>().ok())
+        })
+        .unwrap_or(0);
+    wifi_channel(raw)
 }
 
 fn read_radio(iface: &str, wifi: bool, helpers: &[PathBuf]) -> Radio {
@@ -1084,6 +1253,8 @@ fn read_radio(iface: &str, wifi: bool, helpers: &[PathBuf]) -> Radio {
         noise_valid: false,
         noise: 0,
         tx_mbps: 0,
+        band: String::new(),
+        channel: 0,
     };
     if !wifi || iface.is_empty() {
         return empty;
@@ -1116,13 +1287,16 @@ fn read_radio(iface: &str, wifi: bool, helpers: &[PathBuf]) -> Radio {
         .and_then(|l| l.split(':').nth(1))
         .and_then(|s| s.trim().parse::<i32>().ok())
         .unwrap_or(0);
-    if rssi < 0 {
+    let channel = airport_channel(&out);
+    if rssi < 0 || channel > 0 {
         Radio {
-            rssi_valid: true,
-            rssi,
-            noise_valid: noise < 0,
-            noise,
+            rssi_valid: rssi < 0,
+            rssi: if rssi < 0 { rssi } else { 0 },
+            noise_valid: rssi < 0 && noise < 0,
+            noise: if rssi < 0 { noise } else { 0 },
             tx_mbps: 0,
+            band: String::new(),
+            channel,
         }
     } else {
         empty
@@ -1302,13 +1476,7 @@ fn gather(extra_helpers: &[PathBuf], site: &str) -> Readings {
                 t_gw.join().unwrap_or((0.0, 100.0)),
                 t_dns.join().unwrap_or((false, 0)),
                 t_direct.join().unwrap_or((false, 0, String::new())),
-                t_proxy.join().unwrap_or(ProxyPath {
-                    on: false,
-                    accepting: false,
-                    connect_ms: 0,
-                    kind: String::new(),
-                    address: String::new(),
-                }),
+                t_proxy.join().unwrap_or_else(|_| proxy_closed()),
                 t_bytes.join().unwrap_or(None),
                 t_arp.join().unwrap_or_default(),
             )
@@ -1339,7 +1507,7 @@ fn gather(extra_helpers: &[PathBuf], site: &str) -> Readings {
     } else {
         String::new()
     };
-    let (raw_hops, measured_loss, stun, web_ip, https_raw, name_lookup) =
+    let (raw_hops, measured_loss, stun, web_ip, https_visit, name_lookup) =
         std::thread::scope(|scope| {
             let target = trace_target.clone();
             let trace = scope.spawn(move || wan::trace_path(&target));
@@ -1351,11 +1519,12 @@ fn gather(extra_helpers: &[PathBuf], site: &str) -> Readings {
             let proxy = proxy_for_https.clone();
             let https = scope.spawn(move || {
                 if host.is_empty() {
-                    wan::HttpsRaw::not_run()
-                } else if proxy.is_empty() {
-                    wan::https_probe(&host, None)
+                    (wan::HttpsRaw::not_run(), Vec::new())
                 } else {
-                    wan::https_probe(&host, Some(proxy.as_str()))
+                    let via = if proxy.is_empty() { None } else { Some(proxy) };
+                    let raw = wan::https_probe(&host, via.as_deref());
+                    let urls = wan::follow_redirects(&raw.redirect_url, via.as_deref());
+                    (raw, urls)
                 }
             });
             let host = https_host.clone();
@@ -1371,10 +1540,14 @@ fn gather(extra_helpers: &[PathBuf], site: &str) -> Readings {
                 loss.join().unwrap_or(None),
                 stun.join().unwrap_or((String::new(), None)),
                 web.join().unwrap_or_default(),
-                https.join().unwrap_or_else(|_| wan::HttpsRaw::not_run()),
+                https
+                    .join()
+                    .unwrap_or_else(|_| (wan::HttpsRaw::not_run(), Vec::new())),
                 lookup.join().unwrap_or(wan::NameLookup::Unchecked),
             )
         });
+    let (https_raw, redirect_urls) = https_visit;
+    let redirect = wan::redirect_fact(&https_host, &redirect_urls);
     let wan_hops = wan::finish_probes(&raw_hops, direct_ok);
     let (mapped_ip, symmetric) = stun;
     let nat_line = wan::nat_fact(&nic_ip, &mapped_ip, &web_ip, symmetric, &wan_hops);
@@ -1443,6 +1616,12 @@ fn gather(extra_helpers: &[PathBuf], site: &str) -> Readings {
         nat_line,
         https_kind,
         https_line,
+        band: radio.band,
+        channel: radio.channel,
+        local_proxy_port: proxy_path.local_port,
+        clash_mode: proxy_path.clash_mode,
+        redirect_count: redirect.count,
+        redirect_portal: redirect.portal,
     }
 }
 
@@ -1518,6 +1697,12 @@ mod tests {
             nat_line: String::new(),
             https_kind: String::new(),
             https_line: String::new(),
+            band: String::new(),
+            channel: 0,
+            local_proxy_port: 0,
+            clash_mode: String::new(),
+            redirect_count: 0,
+            redirect_portal: false,
         }
     }
 
@@ -1602,7 +1787,14 @@ mod tests {
         let chain = judge(&r);
         assert_eq!(chain.problem_id, "nic");
         assert_eq!(chain.conclusion, "出网断在网卡。");
-        assert_eq!(chain.next, "网卡没有地址。重新连接 Wi-Fi，或把网线插上。");
+        let book = chain.playbook.unwrap();
+        assert_eq!(book.id, "nic-down");
+        assert_eq!(chain.next, book.check_first);
+        assert!(book.look_at.iter().any(|item| item.contains("地址")));
+        assert!(book
+            .never_auto
+            .iter()
+            .all(|item| item.starts_with("不要自动")));
     }
 
     #[test]
@@ -1615,7 +1807,11 @@ mod tests {
         assert_eq!(chain.hops[1].number, -80);
         assert_eq!(chain.hops[1].unit, "dBm");
         assert_eq!(chain.conclusion, "出网慢在网卡。");
-        assert_eq!(chain.next, "信号偏弱。靠近路由器，或改用网线。");
+        let book = chain.playbook.unwrap();
+        assert_eq!(book.id, "nic-weak");
+        assert_eq!(chain.next, book.check_first);
+        assert!(book.look_at.iter().any(|item| item.contains("信道")));
+        assert!(!chain.next.contains("改成 223.5.5.5"));
     }
 
     #[test]
@@ -1627,7 +1823,13 @@ mod tests {
         let chain = judge(&r);
         assert_eq!(chain.hops[1].mark, "慢");
         assert_eq!(chain.hops[1].number, 10);
-        assert_eq!(chain.next, "网卡速率偏低。换一根线，或检查交换机端口。");
+        let book = chain.playbook.unwrap();
+        assert_eq!(book.id, "nic-cable");
+        assert_eq!(chain.next, book.check_first);
+        assert!(book
+            .never_auto
+            .iter()
+            .any(|item| item.contains("不要自动重启光猫")));
     }
 
     #[test]
@@ -1638,7 +1840,14 @@ mod tests {
         let chain = judge(&r);
         assert_eq!(chain.problem_id, "dns");
         assert_eq!(chain.conclusion, "出网断在 DNS。");
-        assert_eq!(chain.next, "DNS 没有解析。改成 223.5.5.5 后再测。");
+        let book = chain.playbook.unwrap();
+        assert_eq!(book.id, "dns-down");
+        assert_eq!(chain.next, book.check_first);
+        assert!(!chain.next.contains("改成 223.5.5.5"));
+        assert!(book
+            .never_auto
+            .iter()
+            .any(|item| item.contains("不要自动把 DNS 改成 223.5.5.5")));
         assert_eq!(chain.hops[5].mark, "通");
     }
 
@@ -1650,6 +1859,13 @@ mod tests {
         assert_eq!(chain.hops[3].mark, "慢");
         assert_eq!(chain.hops[3].number, 350);
         assert_eq!(chain.conclusion, "出网慢在 DNS。");
+        let book = chain.playbook.unwrap();
+        assert_eq!(book.id, "dns-slow");
+        assert_eq!(chain.next, book.check_first);
+        assert!(book
+            .never_auto
+            .iter()
+            .any(|item| item.contains("不要自动关掉系统代理")));
     }
 
     #[test]
@@ -1671,10 +1887,14 @@ mod tests {
         assert_eq!(chain.problem_id, "proxy");
         assert_eq!(chain.hops[4].mark, "断");
         assert_eq!(chain.hops[5].mark, "通");
-        assert_eq!(
-            chain.next,
-            "代理挡在路上。关掉系统代理，或重新打开代理软件。"
-        );
+        let book = chain.playbook.unwrap();
+        assert_eq!(book.id, "proxy-down");
+        assert_eq!(chain.next, book.check_first);
+        assert!(!chain.next.contains("关掉系统代理"));
+        assert!(book
+            .never_auto
+            .iter()
+            .any(|item| item.contains("不要自动关掉系统代理")));
     }
 
     #[test]
@@ -1707,6 +1927,10 @@ mod tests {
         assert_eq!(chain.hops[4].number, 619);
         assert_eq!(chain.hops[5].mark, "通");
         assert_eq!(chain.conclusion, "出网慢在代理。");
+        let book = chain.playbook.unwrap();
+        assert_eq!(book.id, "proxy-slow");
+        assert!(!book.check_first.contains("关掉系统代理"));
+        assert!(book.never_auto.iter().any(|item| item.contains("不要自动")));
     }
 
     #[test]
@@ -1995,7 +2219,9 @@ round-trip min/avg/max/stddev = 1.101/2.504/4.002/0.900 ms
         let chain = judge(&r);
         assert_eq!(chain.problem_id, "nic");
         assert_eq!(chain.hops[1].detail, "没有从路由器拿到地址");
-        assert_eq!(chain.next, "路由器没有发地址。重新连接后再测。");
+        let book = chain.playbook.unwrap();
+        assert_eq!(book.id, "nic-address");
+        assert_eq!(chain.next, book.check_first);
     }
 
     #[test]
@@ -2023,7 +2249,10 @@ round-trip min/avg/max/stddev = 1.101/2.504/4.002/0.900 ms
         let chain = judge(&r);
         assert_eq!(chain.hops[1].mark, "慢");
         assert!(chain.hops[1].detail.contains("噪声 -70"));
-        assert_eq!(chain.next, "无线链路质量差。换一个信道，或靠近路由器。");
+        let book = chain.playbook.unwrap();
+        assert_eq!(book.id, "nic-air");
+        assert_eq!(chain.next, book.check_first);
+        assert!(book.look_at.iter().any(|item| item.contains("信道")));
     }
 
     #[test]
@@ -2050,6 +2279,178 @@ en0   1500  <Link#14>   aa:bb:cc:dd:ee:ff  10 0 1000 20 0 2000 0
 en0   1500  192.168.1   192.168.1.20       10 0 50 20 0 80 0
 ";
         assert_eq!(parse_iface_bytes(text, "en0"), Some((1000, 2000)));
+    }
+
+    #[test]
+    fn wifi_detail_keeps_band_and_channel_on_the_same_card() {
+        let sample = serde_json::json!({
+            "rssi": -55,
+            "rssiValid": true,
+            "noise": -92,
+            "channel": 36,
+            "band": "5GHz",
+            "txRate": 866
+        });
+        let radio = radio_from_json(&sample).unwrap();
+        assert_eq!(radio.band, "5 GHz");
+        assert_eq!(radio.channel, 36);
+        assert!(radio.rssi_valid);
+
+        let mut r = healthy();
+        r.band = radio.band;
+        r.channel = radio.channel;
+        r.noise = radio.noise;
+        r.noise_valid = radio.noise_valid;
+        r.tx_mbps = radio.tx_mbps;
+        let chain = judge(&r);
+        assert_eq!(chain.hops[1].mark, "通");
+        assert_eq!(
+            chain.hops[1].detail,
+            "192.168.1.20 · 家里 · 5 GHz · 信道 36 · 噪声 -92 · 866 Mbps"
+        );
+        assert_eq!(chain.hops.len(), 6);
+
+        let mut wired = healthy();
+        wired.nic_wifi = false;
+        wired.rssi_valid = false;
+        wired.mbps = 1000;
+        wired.band = "5 GHz".into();
+        wired.channel = 36;
+        wired.nic_label = "USB 10/100/1000 LAN".into();
+        let chain = judge(&wired);
+        assert!(!chain.hops[1].detail.contains("信道"));
+        assert!(!chain.hops[1].detail.contains("GHz"));
+        assert!(chain.hops[1].detail.contains("USB 10/100/1000 LAN"));
+    }
+
+    #[test]
+    fn radio_json_keeps_channel_when_the_signal_is_missing() {
+        let sample = serde_json::json!({
+            "rssi": 0,
+            "rssiValid": false,
+            "channel": 6,
+            "band": "2.4GHz",
+            "txRate": 0
+        });
+        let radio = radio_from_json(&sample).unwrap();
+        assert!(!radio.rssi_valid);
+        assert_eq!(radio.band, "2.4 GHz");
+        assert_eq!(radio.channel, 6);
+        assert!(radio_from_json(&serde_json::json!({"rssi": 0, "rssiValid": false})).is_none());
+        let airport = "     agrCtlRSSI: -48\n     agrCtlNoise: -90\n     channel: 149,80\n";
+        assert_eq!(airport_channel(airport), 149);
+    }
+
+    #[test]
+    fn a_listening_local_port_does_not_judge_the_proxy_when_the_system_proxy_is_off() {
+        let mut r = healthy();
+        r.proxy_on = false;
+        r.local_proxy_port = 7897;
+        r.clash_mode = "规则模式".into();
+        let chain = judge(&r);
+        assert_eq!(chain.hops[4].mark, "通");
+        assert_eq!(chain.hops[4].number, 0);
+        assert_eq!(
+            chain.hops[4].detail,
+            "系统代理关着，本机 7897 在听 · 规则模式"
+        );
+        assert_ne!(chain.problem_id, "proxy");
+        assert!(chain.playbook.is_none());
+        assert_eq!(chain.conclusion, "从这台电脑到外网是通的。");
+
+        r.clash_mode.clear();
+        let chain = judge(&r);
+        assert_eq!(chain.hops[4].mark, "通");
+        assert_eq!(chain.hops[4].detail, "系统代理关着，本机 7897 在听");
+
+        r.dns_ok = false;
+        r.dns_ms = 0;
+        let chain = judge(&r);
+        assert_eq!(chain.problem_id, "dns");
+        assert_eq!(chain.hops[4].mark, "通");
+        assert_eq!(chain.playbook.unwrap().id, "dns-down");
+    }
+
+    #[test]
+    fn clash_mode_is_one_line_and_ignores_the_rest_of_the_body() {
+        assert_eq!(
+            clash_mode_from_body(r#"{"mode":"global","secret":"hidden","port":7890}"#).as_deref(),
+            Some("全局模式")
+        );
+        assert_eq!(
+            clash_mode_from_body(r#"{"mode":"direct"}"#).as_deref(),
+            Some("直连模式")
+        );
+        assert!(clash_mode_from_body(r#"{"mode":"script"}"#).is_none());
+        assert_eq!(LOCAL_PROXY_PORTS, &[7897, 7890, 7893, 1080, 1087, 20171]);
+        let mut r = healthy();
+        r.proxy_on = true;
+        r.proxy_accepting = true;
+        r.proxy_address = "127.0.0.1:7897".into();
+        r.clash_mode = "全局模式".into();
+        r.via_tested = true;
+        r.via_ok = true;
+        r.via_ms = 30;
+        let chain = judge(&r);
+        assert_eq!(chain.hops[4].mark, "通");
+        assert_eq!(chain.hops[4].detail, "127.0.0.1:7897 · 全局模式");
+        assert!(!chain.hops[4].detail.contains("secret"));
+    }
+
+    #[test]
+    fn a_portal_redirect_is_a_fact_and_does_not_change_the_mark() {
+        let mut r = healthy();
+        r.https_kind = "ok".into();
+        r.https_line = "www.baidu.com · 证书正常".into();
+        r.redirect_count = 1;
+        r.redirect_portal = true;
+        let chain = judge(&r);
+        assert_eq!(chain.hops[5].mark, "通");
+        assert_eq!(chain.wan.https, "www.baidu.com · 证书正常 · 像门户认证");
+        assert_eq!(chain.wan.https_kind, "ok");
+        assert_eq!(chain.problem_id, "wan");
+        let book = chain.playbook.unwrap();
+        assert_eq!(book.id, "wan-portal");
+        assert_eq!(book.look_at[0], "是不是门户认证");
+        assert!(book
+            .never_auto
+            .iter()
+            .any(|item| item.contains("不要自动关掉系统代理")));
+        assert!(book
+            .never_auto
+            .iter()
+            .any(|item| item.contains("不要自动改网络")));
+        assert!(!chain.next.contains("关掉系统代理"));
+        assert_eq!(chain.conclusion, "外网是通的。这一页在跳转。");
+
+        r.nic_up = false;
+        let chain = judge(&r);
+        assert_eq!(chain.problem_id, "nic");
+        assert_eq!(chain.conclusion, "出网断在网卡。");
+        assert_eq!(chain.playbook.unwrap().id, "nic-down");
+        assert_eq!(chain.wan.https, "www.baidu.com · 证书正常 · 像门户认证");
+        assert_eq!(chain.hops[5].mark, "通");
+    }
+
+    #[test]
+    fn many_redirects_stay_words_and_leave_the_mark_alone() {
+        let mut r = healthy();
+        r.https_kind = "ok".into();
+        r.https_line = "www.baidu.com · 证书正常".into();
+        r.redirect_count = 6;
+        r.redirect_portal = false;
+        let chain = judge(&r);
+        assert_eq!(chain.hops[5].mark, "通");
+        assert_eq!(chain.hops[5].number, 28);
+        assert_eq!(chain.wan.https, "www.baidu.com · 证书正常 · 跳了 6 次");
+        assert_eq!(chain.playbook.unwrap().id, "wan-portal");
+        assert!(!chain.conclusion.contains("断"));
+
+        r.redirect_count = 2;
+        let chain = judge(&r);
+        assert_eq!(chain.wan.https, "www.baidu.com · 证书正常");
+        assert!(chain.playbook.is_none());
+        assert_eq!(chain.conclusion, "从这台电脑到外网是通的。");
     }
 
     #[test]

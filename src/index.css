@@ -319,10 +319,47 @@ li {
   color: #92231f;
 }
 
-.wan-block .site {
-  grid-row: auto;
-  grid-column: auto;
+.site-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 0.35rem 0.45rem;
   margin-top: 0.35rem;
+}
+
+.site-row .site {
+  flex: 1 1 9rem;
+  width: auto;
+  min-width: 0;
+  margin-top: 0;
+}
+
+.sites {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+}
+
+.sites button {
+  width: auto;
+  margin-top: 0;
+  padding: 0.08rem 0.42rem 0.1rem;
+  border: 1px solid #c9c1b3;
+  background: transparent;
+  color: #6f675c;
+  font-size: 0.75rem;
+  line-height: 1.4;
+}
+
+.sites button:hover:not(:disabled) {
+  background: transparent;
+  border-color: #1c1915;
+  color: #1c1915;
+}
+
+.sites button[aria-pressed='true'] {
+  border-color: #1c1915;
+  color: #1c1915;
 }
 
 .action {
