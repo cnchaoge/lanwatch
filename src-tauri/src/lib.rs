@@ -1,9 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod geo;
 mod wan;
 
 use serde::Serialize;
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Mutex;
@@ -86,6 +87,8 @@ struct Readings {
     self_conflict: bool,
     gw_conflict: bool,
     gw_mac_changed: bool,
+    /// Other LAN addresses that map to two or more MACs. Not this host, not the gateway.
+    lan_conflicts: Vec<String>,
     tx_bps: i64,
     rx_bps: i64,
     wan_hops: Vec<wan::WanHop>,
@@ -181,6 +184,15 @@ fn judge(r: &Readings) -> Chain {
         router = hop("router", "路由器", Mark::Down, 0, "ms", &line);
     } else if r.gw_mac_changed && router.mark != "断" {
         let line = format!("{} · 硬件地址变了", router.detail);
+        router = hop("router", "路由器", Mark::Slow, router.number, "ms", &line);
+    }
+    if !r.lan_conflicts.is_empty() && router.mark != "断" {
+        let fact = r.lan_conflicts.join(" · ");
+        let line = if router.detail.is_empty() {
+            fact
+        } else {
+            format!("{} · {fact}", router.detail)
+        };
         router = hop("router", "路由器", Mark::Slow, router.number, "ms", &line);
     }
     let busy = r.tx_bps.max(r.rx_bps) >= 1_000_000;
@@ -638,6 +650,7 @@ fn segment_book(hop: &Hop) -> Option<wan::Playbook> {
         "nic" if hop.unit == "Mbps" => "nic-cable",
         "nic" if hop.mark == "慢" && hop.unit == "dBm" && hop.number <= -75 => "nic-weak",
         "nic" if hop.mark == "慢" => "nic-air",
+        "router" if hop.mark != "断" && hop.detail.contains("有两块网卡") => "router-lan",
         "dns" if hop.mark == "断" => "dns-down",
         "dns" if hop.mark == "慢" => "dns-slow",
         "proxy" if hop.mark == "断" => "proxy-down",
@@ -837,6 +850,7 @@ struct IfaceSnap {
     ip: String,
     link_local: bool,
     mbps: i64,
+    broadcast: String,
 }
 
 fn snap_from_dump(port: &str, device: &str, dump: &str) -> IfaceSnap {
@@ -849,6 +863,7 @@ fn snap_from_dump(port: &str, device: &str, dump: &str) -> IfaceSnap {
         link_local: ip.starts_with("169.254."),
         mbps: media_mbps(dump),
         ip,
+        broadcast: ipv4_broadcast(dump),
     }
 }
 
@@ -1580,9 +1595,12 @@ struct ArpRow {
 }
 
 fn arp_entries() -> Vec<ArpRow> {
-    let out = run_cmd("arp", &["-a"]);
+    parse_arp(&run_cmd("arp", &["-a"]))
+}
+
+fn parse_arp(text: &str) -> Vec<ArpRow> {
     let mut rows = Vec::new();
-    for line in out.lines() {
+    for line in text.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() < 4 {
             continue;
@@ -1592,7 +1610,7 @@ fn arp_entries() -> Vec<ArpRow> {
             .trim_end_matches(')')
             .to_string();
         let mac = parts[3].to_string();
-        if ip.is_empty() || !mac.contains(':') || mac.eq_ignore_ascii_case("(incomplete)") {
+        if ip.is_empty() || normalize_mac(&mac).is_empty() {
             continue;
         }
         rows.push(ArpRow { ip, mac });
@@ -1600,14 +1618,167 @@ fn arp_entries() -> Vec<ArpRow> {
     rows
 }
 
-fn macs_for<'a>(rows: &'a [ArpRow], ip: &str) -> Vec<&'a str> {
-    let mut macs = Vec::new();
+fn normalize_mac(mac: &str) -> String {
+    let mac = mac.trim().to_ascii_lowercase();
+    if !mac.contains(':')
+        || mac == "(incomplete)"
+        || mac == "ff:ff:ff:ff:ff:ff"
+        || mac == "00:00:00:00:00:00"
+    {
+        return String::new();
+    }
+    mac
+}
+
+fn macs_by_ip(rows: &[ArpRow]) -> Vec<(String, Vec<String>)> {
+    let mut grouped: Vec<(String, Vec<String>)> = Vec::new();
     for row in rows {
-        if row.ip == ip && !macs.contains(&row.mac.as_str()) {
-            macs.push(row.mac.as_str());
+        let mac = normalize_mac(&row.mac);
+        if row.ip.is_empty() || mac.is_empty() {
+            continue;
+        }
+        if let Some((_, macs)) = grouped.iter_mut().find(|(ip, _)| ip == &row.ip) {
+            if !macs.contains(&mac) {
+                macs.push(mac);
+            }
+        } else {
+            grouped.push((row.ip.clone(), vec![mac]));
         }
     }
-    macs
+    grouped
+}
+
+fn macs_for(rows: &[ArpRow], ip: &str) -> Vec<String> {
+    macs_by_ip(rows)
+        .into_iter()
+        .find(|(row_ip, _)| row_ip == ip)
+        .map(|(_, macs)| macs)
+        .unwrap_or_default()
+}
+
+fn lan_ip(ip: &str) -> bool {
+    let Ok(addr) = ip.parse::<Ipv4Addr>() else {
+        return false;
+    };
+    if addr.is_loopback() || addr.is_unspecified() || addr.is_multicast() || addr.is_broadcast() {
+        return false;
+    }
+    let [a, b, _, _] = addr.octets();
+    a == 10
+        || (a == 172 && (16..=31).contains(&b))
+        || (a == 192 && b == 168)
+        || (a == 169 && b == 254)
+}
+
+/// LAN addresses other than this host and the gateway that have two or more MACs.
+fn other_lan_conflicts(rows: &[ArpRow], self_ip: &str, gw_ip: &str) -> Vec<String> {
+    let mut phrases = Vec::new();
+    for (ip, macs) in macs_by_ip(rows) {
+        if macs.len() < 2 || ip == self_ip || ip == gw_ip || !lan_ip(&ip) {
+            continue;
+        }
+        phrases.push(format!("{ip} 有两块网卡"));
+    }
+    if phrases.len() > 3 {
+        let extra = phrases.len() - 3;
+        phrases.truncate(3);
+        phrases.push(format!("另有 {extra} 个地址有两块网卡"));
+    }
+    phrases
+}
+
+fn ipv4_broadcast(ifconfig: &str) -> String {
+    for line in ifconfig.lines() {
+        let t = line.trim();
+        if !t.contains("inet ") || t.contains("inet6") {
+            continue;
+        }
+        let parts: Vec<&str> = t.split_whitespace().collect();
+        let mut ip = String::new();
+        let mut mask = String::new();
+        let mut broadcast = String::new();
+        let mut i = 0;
+        while i < parts.len() {
+            match parts[i] {
+                "inet" if i + 1 < parts.len() => {
+                    ip = parts[i + 1].to_string();
+                    i += 2;
+                }
+                "netmask" if i + 1 < parts.len() => {
+                    mask = parts[i + 1].to_string();
+                    i += 2;
+                }
+                "broadcast" if i + 1 < parts.len() => {
+                    broadcast = parts[i + 1].to_string();
+                    i += 2;
+                }
+                _ => i += 1,
+            }
+        }
+        if let Some(addr) = usable_broadcast(&broadcast) {
+            return addr;
+        }
+        if let Some(addr) = broadcast_from(&ip, &mask) {
+            return addr;
+        }
+    }
+    String::new()
+}
+
+fn usable_broadcast(addr: &str) -> Option<String> {
+    let ip: Ipv4Addr = addr.parse().ok()?;
+    if ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() || ip.is_loopback() {
+        return None;
+    }
+    Some(ip.to_string())
+}
+
+fn broadcast_from(ip: &str, mask: &str) -> Option<String> {
+    let ip = u32::from(ip.parse::<Ipv4Addr>().ok()?);
+    let mask = parse_mask(mask)?;
+    if mask == 0 || mask == u32::MAX {
+        return None;
+    }
+    let bcast = ip | !mask;
+    usable_broadcast(&Ipv4Addr::from(bcast).to_string())
+}
+
+fn parse_mask(mask: &str) -> Option<u32> {
+    if let Some(hex) = mask.strip_prefix("0x") {
+        return u32::from_str_radix(hex, 16).ok();
+    }
+    mask.parse::<Ipv4Addr>().ok().map(u32::from)
+}
+
+fn lan_broadcasts(snaps: &[IfaceSnap]) -> Vec<String> {
+    let mut out = Vec::new();
+    for snap in snaps {
+        if !snap_up(snap) || snap.broadcast.is_empty() || out.contains(&snap.broadcast) {
+            continue;
+        }
+        out.push(snap.broadcast.clone());
+        if out.len() == 2 {
+            break;
+        }
+    }
+    out
+}
+
+/// One ping at the subnet broadcast, then the caller reads `arp -a`.
+/// `arp -a` only shows what is already cached. This does not walk the subnet
+/// host by host. A failure is ignored and does not by itself mark a segment down.
+fn nudge_broadcast(broadcast: &str) {
+    if usable_broadcast(broadcast).is_none() {
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = run_cmd("ping", &["-b", "-c", "1", "-W", "1", broadcast]);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = run_cmd("ping", &["-c", "1", "-W", "1000", broadcast]);
+    }
 }
 
 fn parse_iface_bytes(text: &str, iface: &str) -> Option<(u64, u64)> {
@@ -1729,6 +1900,7 @@ fn gather(extra_helpers: &[PathBuf], site: &str) -> Readings {
     let dns_server = dns.first().cloned().unwrap_or_default();
     let has_dns = !dns_server.is_empty();
     let has_gw = usable_host(&gateway);
+    let broadcasts = lan_broadcasts(&snaps);
 
     let (loopback, gateway_ping, dns_result, direct, proxy_path, bytes, arp) =
         std::thread::scope(|s| {
@@ -1751,7 +1923,12 @@ fn gather(extra_helpers: &[PathBuf], site: &str) -> Readings {
             });
             let iface_for_bytes = iface.clone();
             let t_bytes = s.spawn(move || iface_bytes(&iface_for_bytes));
-            let t_arp = s.spawn(arp_entries);
+            let t_arp = s.spawn(move || {
+                for broadcast in &broadcasts {
+                    nudge_broadcast(broadcast);
+                }
+                arp_entries()
+            });
             let t_direct = s.spawn(direct_reach);
             let t_proxy = s.spawn(inspect_proxy_path);
             (
@@ -1834,6 +2011,19 @@ fn gather(extra_helpers: &[PathBuf], site: &str) -> Readings {
     let wan_hops = wan::finish_probes(&raw_hops, direct_ok);
     let (mapped_ip, symmetric) = stun;
     let nat_line = wan::nat_fact(&nic_ip, &mapped_ip, &web_ip, symmetric, &wan_hops);
+    let public_ip = wan::exit_public(&mapped_ip, &web_ip);
+    let country = if public_ip.is_empty() {
+        String::new()
+    } else {
+        let (_, _, cc) = wan::lookup_origin(&public_ip);
+        geo::country_zh(&cc)
+    };
+    let city = if country.is_empty() {
+        String::new()
+    } else {
+        geo::city_for(&public_ip)
+    };
+    let nat_line = wan::with_exit_place(&nat_line, &country, &city);
     let (https_kind, https_line) = if invalid_site {
         ("input".to_string(), "网址没法识别".to_string())
     } else {
@@ -1847,6 +2037,7 @@ fn gather(extra_helpers: &[PathBuf], site: &str) -> Readings {
     let dest_loss = measured_loss.unwrap_or(-1.0);
     let gw_macs = macs_for(&arp, &gateway);
     let self_macs = macs_for(&arp, &nic_ip);
+    let lan_conflicts = other_lan_conflicts(&arp, &nic_ip, &gateway);
     let gw_mac = if gw_macs.len() == 1 {
         gw_macs[0].to_string()
     } else {
@@ -1891,6 +2082,7 @@ fn gather(extra_helpers: &[PathBuf], site: &str) -> Readings {
         self_conflict: self_macs.len() > 1,
         gw_conflict: gw_macs.len() > 1,
         gw_mac_changed,
+        lan_conflicts,
         tx_bps,
         rx_bps,
         wan_hops,
@@ -1978,6 +2170,7 @@ mod tests {
             self_conflict: false,
             gw_conflict: false,
             gw_mac_changed: false,
+            lan_conflicts: Vec::new(),
             tx_bps: 0,
             rx_bps: 0,
             wan_hops: Vec::new(),
@@ -2512,6 +2705,94 @@ round-trip min/avg/max/stddev = 1.101/2.504/4.002/0.900 ms
         assert_eq!(chain.next, "网关的设备变了。等它稳定，或重启路由器后再测。");
     }
 
+    fn six(chain: &Chain) {
+        assert_eq!(
+            chain
+                .hops
+                .iter()
+                .map(|hop| hop.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["这台电脑", "网卡", "路由器", "DNS", "代理", "外网"]
+        );
+    }
+
+    #[test]
+    fn another_lan_address_with_two_macs_is_slow_on_the_router() {
+        let mut r = healthy();
+        r.lan_conflicts = vec!["192.168.1.30 有两块网卡".into()];
+        let chain = judge(&r);
+        six(&chain);
+        assert_eq!(chain.hops[2].mark, "慢");
+        assert_eq!(
+            chain.hops[2].detail,
+            "192.168.1.1 · 192.168.1.30 有两块网卡"
+        );
+        assert_eq!(chain.problem_id, "router");
+        assert_eq!(chain.conclusion, "出网慢在路由器。");
+        let book = chain.playbook.unwrap();
+        assert_eq!(book.id, "router-lan");
+        assert_eq!(chain.next, book.check_first);
+        assert!(book.look_at.iter().any(|item| item.contains("地址")));
+        assert!(book
+            .never_auto
+            .iter()
+            .any(|item| item.contains("不要自动改地址")));
+        assert!(book
+            .never_auto
+            .iter()
+            .any(|item| item.contains("不要自动重启路由器")));
+        assert!(book
+            .never_auto
+            .iter()
+            .all(|item| item.starts_with("不要自动")));
+    }
+
+    #[test]
+    fn another_lan_clash_does_not_override_a_dead_router_or_an_earlier_break() {
+        let mut dead = healthy();
+        dead.gw_replied = false;
+        dead.gw_loss = 100.0;
+        dead.lan_conflicts = vec!["192.168.1.30 有两块网卡".into()];
+        let chain = judge(&dead);
+        six(&chain);
+        assert_eq!(chain.hops[2].mark, "断");
+        assert_eq!(chain.hops[2].detail, "192.168.1.1 没有回应");
+        assert_eq!(chain.problem_id, "router");
+        assert!(chain.playbook.is_none());
+
+        let mut earlier = healthy();
+        earlier.lan_conflicts = vec!["192.168.1.30 有两块网卡".into()];
+        earlier.self_conflict = true;
+        let chain = judge(&earlier);
+        six(&chain);
+        assert_eq!(chain.problem_id, "computer");
+        assert_eq!(chain.hops[0].mark, "断");
+        assert_eq!(chain.hops[0].detail, "本机地址有两块网卡");
+        assert_eq!(
+            chain.next,
+            "本机地址和另一台设备撞了。改掉重复的地址后再测。"
+        );
+        assert!(chain.playbook.is_none());
+        assert_eq!(chain.hops[2].mark, "慢");
+        assert!(chain.hops[2].detail.contains("192.168.1.30 有两块网卡"));
+    }
+
+    #[test]
+    fn gateway_clash_stays_down_when_another_address_also_clashes() {
+        let mut r = healthy();
+        r.gw_conflict = true;
+        r.lan_conflicts = vec!["192.168.1.30 有两块网卡".into()];
+        let chain = judge(&r);
+        six(&chain);
+        assert_eq!(chain.hops[2].mark, "断");
+        assert_eq!(chain.hops[2].detail, "192.168.1.1 有两块网卡");
+        assert_eq!(
+            chain.next,
+            "网关地址有两台设备在应答。只留一台路由器后再测。"
+        );
+        assert!(chain.playbook.is_none());
+    }
+
     #[test]
     fn link_local_means_the_router_gave_no_address() {
         let mut r = healthy();
@@ -2572,6 +2853,130 @@ round-trip min/avg/max/stddev = 1.101/2.504/4.002/0.900 ms
         ];
         assert_eq!(macs_for(&rows, "192.168.1.1").len(), 2);
         assert!(macs_for(&rows, "192.168.1.20").is_empty());
+    }
+
+    #[test]
+    fn other_lan_rows_with_two_macs_stay_on_the_router_row() {
+        let text = "\
+? (192.168.1.20) at aa:aa:aa:aa:aa:01 on en0 ifscope [ethernet]
+? (192.168.1.20) at aa:aa:aa:aa:aa:02 on en0 ifscope [ethernet]
+? (192.168.1.1) at bb:bb:bb:bb:bb:01 on en0 ifscope [ethernet]
+? (192.168.1.1) at bb:bb:bb:bb:bb:02 on en0 ifscope [ethernet]
+? (192.168.1.30) at cc:cc:cc:cc:cc:01 on en0 ifscope [ethernet]
+? (192.168.1.30) at CC:CC:CC:CC:CC:02 on en0 ifscope [ethernet]
+? (192.168.1.30) at cc:cc:cc:cc:cc:01 on en0 ifscope [ethernet]
+? (192.168.1.40) at dd:dd:dd:dd:dd:01 on en0 ifscope [ethernet]
+? (192.168.1.40) at DD:DD:DD:DD:DD:01 on en0 ifscope [ethernet]
+? (10.1.1.8) at ee:ee:ee:ee:ee:01 on en0 ifscope [ethernet]
+? (10.1.1.8) at ee:ee:ee:ee:ee:02 on en0 ifscope [ethernet]
+? (1.2.3.4) at 11:11:11:11:11:01 on en0 ifscope [ethernet]
+? (1.2.3.4) at 11:11:11:11:11:02 on en0 ifscope [ethernet]
+? (192.168.1.50) at (incomplete) on en0 ifscope [ethernet]
+? (224.0.0.251) at 01:00:5e:00:00:fb on en0 ifscope [ethernet]
+? (224.0.0.251) at 01:00:5e:00:00:01 on en0 ifscope [ethernet]
+";
+        let rows = parse_arp(text);
+        assert!(macs_for(&rows, "192.168.1.20").len() > 1);
+        assert!(macs_for(&rows, "192.168.1.1").len() > 1);
+        assert_eq!(macs_for(&rows, "192.168.1.40").len(), 1);
+        let others = other_lan_conflicts(&rows, "192.168.1.20", "192.168.1.1");
+        assert_eq!(
+            others,
+            vec![
+                "192.168.1.30 有两块网卡".to_string(),
+                "10.1.1.8 有两块网卡".to_string(),
+            ]
+        );
+        assert!(others.iter().all(|line| !line.contains("1.2.3.4")));
+        assert!(others.iter().all(|line| !line.contains("224.0.0.251")));
+        assert!(others.iter().all(|line| !line.contains("192.168.1.20")));
+        assert!(others.iter().all(|line| !line.contains("192.168.1.1")));
+
+        let mut r = healthy();
+        r.self_conflict = macs_for(&rows, "192.168.1.20").len() > 1;
+        r.gw_conflict = macs_for(&rows, "192.168.1.1").len() > 1;
+        r.lan_conflicts = other_lan_conflicts(&rows, "192.168.1.20", "192.168.1.1");
+        let chain = judge(&r);
+        six(&chain);
+        assert_eq!(chain.problem_id, "computer");
+        assert_eq!(chain.hops[0].detail, "本机地址有两块网卡");
+        assert_eq!(chain.hops[2].mark, "断");
+        assert_eq!(chain.hops[2].detail, "192.168.1.1 有两块网卡");
+
+        let only_other = other_lan_conflicts(&rows, "192.168.1.20", "192.168.1.1");
+        let mut quiet = healthy();
+        quiet.self_conflict = false;
+        quiet.gw_conflict = false;
+        quiet.lan_conflicts = only_other;
+        let chain = judge(&quiet);
+        six(&chain);
+        assert_eq!(chain.hops[0].mark, "通");
+        assert_eq!(chain.hops[0].detail, "测试机");
+        assert_eq!(chain.hops[2].mark, "慢");
+        assert_eq!(
+            chain.hops[2].detail,
+            "192.168.1.1 · 192.168.1.30 有两块网卡 · 10.1.1.8 有两块网卡"
+        );
+        assert_eq!(chain.problem_id, "router");
+        assert_eq!(chain.playbook.unwrap().id, "router-lan");
+    }
+
+    #[test]
+    fn a_failed_broadcast_probe_does_not_invent_a_break() {
+        assert!(other_lan_conflicts(&[], "192.168.1.20", "192.168.1.1").is_empty());
+        assert!(macs_for(&[], "192.168.1.1").is_empty());
+        nudge_broadcast("");
+        nudge_broadcast("not an address");
+        nudge_broadcast("255.255.255.255");
+        let chain = judge(&healthy());
+        assert_eq!(chain.hops[2].mark, "通");
+        assert_eq!(chain.hops[2].detail, "192.168.1.1");
+    }
+
+    #[test]
+    fn subnet_broadcast_is_read_from_the_iface_and_a_down_link_is_skipped() {
+        let up = "\
+en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	status: active
+	inet 192.168.1.20 netmask 0xffffff00 broadcast 192.168.1.255
+";
+        assert_eq!(ipv4_broadcast(up), "192.168.1.255");
+        let masked = "inet 10.1.2.3 netmask 0xffff0000\n";
+        assert_eq!(ipv4_broadcast(masked), "10.1.255.255");
+        assert_eq!(ipv4_broadcast("status: inactive\n"), "");
+        assert_eq!(
+            ipv4_broadcast("inet 192.168.1.20 netmask 0xffffff00 broadcast 255.255.255.255\n"),
+            "192.168.1.255"
+        );
+        let down = "\
+en7: flags=8822<BROADCAST,SMART,SIMPLEX,MULTICAST> mtu 1500
+	status: inactive
+";
+        let snaps = vec![
+            snap_from_dump("Wi-Fi", "en0", up),
+            snap_from_dump("Ethernet", "en7", down),
+        ];
+        assert_eq!(lan_broadcasts(&snaps), vec!["192.168.1.255".to_string()]);
+    }
+
+    #[test]
+    fn an_exit_place_does_not_change_the_outside_mark() {
+        let mut r = healthy();
+        r.wan_traced = true;
+        r.nat_line = "NAT 192.168.1.20 → 203.0.113.8".into();
+        let chain = judge(&r);
+        six(&chain);
+        assert_eq!(chain.hops[5].mark, "通");
+        assert_eq!(chain.wan.nat, "NAT 192.168.1.20 → 203.0.113.8");
+        assert_eq!(chain.problem_id, "");
+        assert!(chain.playbook.is_none());
+
+        r.nat_line = "NAT 192.168.1.20 → 203.0.113.8 · 中国".into();
+        let chain = judge(&r);
+        assert_eq!(chain.hops[5].mark, "通");
+        assert_eq!(chain.wan.nat, "NAT 192.168.1.20 → 203.0.113.8 · 中国");
+        assert_eq!(chain.problem_id, "");
+        assert!(!chain.wan.nat.contains("AS4134"));
     }
 
     #[test]

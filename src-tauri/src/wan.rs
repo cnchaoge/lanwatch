@@ -1,4 +1,4 @@
-//! Facts for the 外网 segment: hop loss and latency, ASN, NAT, HTTPS, and redirects.
+//! Facts for the 外网 segment: hop loss and latency, ASN, NAT, exit country, HTTPS, and redirects.
 //!
 //! The playbook is text a person can read. Nothing in it is executed.
 //! Redirects are counted and described. They are not followed in order to change
@@ -191,6 +191,12 @@ const BOOKS: &[Book] = &[
         look_at: &["代理这一段的时间", "比直连慢多少"],
         check_first: "代理在拖时间。先看这一段的毫秒。",
         never_auto: &["不要自动关掉系统代理", "不要自动改 DNS", "不要自动换节点"],
+    },
+    Book {
+        id: "router-lan",
+        look_at: &["路由器这一行的地址", "同一个地址是不是有两块网卡"],
+        check_first: "局域网里有地址撞了。先看这一行是哪个地址。",
+        never_auto: &["不要自动改地址", "不要自动重启路由器"],
     },
 ];
 
@@ -524,6 +530,36 @@ fn clean_ip(ip: &str) -> &str {
         IpKind::Public | IpKind::Private | IpKind::Cgnat => ip,
         _ => "",
     }
+}
+
+/// The public end of the NAT line. A private or carrier address is not a place.
+pub fn exit_public(mapped: &str, web: &str) -> String {
+    let mapped = clean_ip(mapped);
+    let web = clean_ip(web);
+    if ip_kind(mapped) == IpKind::Public {
+        mapped.to_string()
+    } else if ip_kind(web) == IpKind::Public {
+        web.to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// Append the exit country, and a city when the local table has one.
+/// The operator stays on the hop ASN line, so it is not repeated here.
+/// An empty country leaves the address line unchanged.
+pub fn with_exit_place(line: &str, country_zh: &str, city: &str) -> String {
+    let country_zh = country_zh.trim();
+    if line.is_empty() || country_zh.is_empty() || line.starts_with("路径上有运营商地址") {
+        return line.to_string();
+    }
+    let mut out = format!("{line} · {country_zh}");
+    let city = city.trim();
+    if !city.is_empty() {
+        out.push_str(" · ");
+        out.push_str(city);
+    }
+    out
 }
 
 /// Empty input uses the sample site. Anything that is not a hostname is refused.
@@ -1195,19 +1231,46 @@ pub fn trace_path(target: &str) -> Vec<ProbeHop> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OriginTxt {
+    pub asn: String,
+    pub country: String,
+}
+
 pub fn parse_asn_txt(text: &str) -> String {
+    parse_origin_txt(text).asn
+}
+
+/// Team Cymru origin TXT: `ASN | prefix | CC | registry | allocated`.
+/// The country is the third field. It is not copied onto every hop.
+pub fn parse_origin_txt(text: &str) -> OriginTxt {
     for line in text.lines() {
         let line = line.trim().trim_matches('"').trim();
         if line.is_empty() {
             continue;
         }
-        let first = line.split('|').next().unwrap_or("").trim();
+        let mut parts = line.split('|');
+        let first = parts.next().unwrap_or("").trim();
         let token = first.trim_start_matches("AS").trim_start_matches("as");
-        if !token.is_empty() && token.chars().all(|c| c.is_ascii_digit()) {
-            return format!("AS{token}");
+        if token.is_empty() || !token.chars().all(|c| c.is_ascii_digit()) {
+            continue;
         }
+        let _prefix = parts.next();
+        let cc = parts.next().unwrap_or("").trim();
+        let country = if cc.len() == 2 && cc.chars().all(|c| c.is_ascii_alphabetic()) {
+            cc.to_ascii_uppercase()
+        } else {
+            String::new()
+        };
+        return OriginTxt {
+            asn: format!("AS{token}"),
+            country,
+        };
     }
-    String::new()
+    OriginTxt {
+        asn: String::new(),
+        country: String::new(),
+    }
 }
 
 pub fn parse_asn_name(text: &str) -> String {
@@ -1241,14 +1304,21 @@ fn origin_query(ip: &str) -> Option<String> {
     ))
 }
 
-fn asn_cache() -> &'static Mutex<HashMap<String, (String, String)>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, (String, String)>>> = OnceLock::new();
+fn asn_cache() -> &'static Mutex<HashMap<String, (String, String, String)>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, (String, String, String)>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 pub fn lookup_asn(ip: &str) -> (String, String) {
+    let (asn, name, _) = lookup_origin(ip);
+    (asn, name)
+}
+
+/// ASN, the existing organization name, and the registry country code.
+/// Callers that draw a hop use only the first two. The country is for the exit address.
+pub fn lookup_origin(ip: &str) -> (String, String, String) {
     if ip_kind(ip) != IpKind::Public {
-        return (String::new(), String::new());
+        return (String::new(), String::new(), String::new());
     }
     {
         let guard = asn_cache().lock().unwrap_or_else(|err| err.into_inner());
@@ -1257,20 +1327,20 @@ pub fn lookup_asn(ip: &str) -> (String, String) {
         }
     }
     let Some(query) = origin_query(ip) else {
-        return (String::new(), String::new());
+        return (String::new(), String::new(), String::new());
     };
     let Some((stdout, _)) = run_bounded(
         "dig",
         &["+short", "+time=1", "+tries=1", "TXT", &query],
         Duration::from_secs(3),
     ) else {
-        return (String::new(), String::new());
+        return (String::new(), String::new(), String::new());
     };
-    let asn = parse_asn_txt(&stdout);
-    if asn.is_empty() {
-        return (String::new(), String::new());
+    let origin = parse_origin_txt(&stdout);
+    if origin.asn.is_empty() {
+        return (String::new(), String::new(), String::new());
     }
-    let name_query = format!("{asn}.asn.cymru.com");
+    let name_query = format!("{}.asn.cymru.com", origin.asn);
     let name = run_bounded(
         "dig",
         &["+short", "+time=1", "+tries=1", "TXT", &name_query],
@@ -1279,8 +1349,11 @@ pub fn lookup_asn(ip: &str) -> (String, String) {
     .map(|(text, _)| parse_asn_name(&text))
     .unwrap_or_default();
     let mut guard = asn_cache().lock().unwrap_or_else(|err| err.into_inner());
-    guard.insert(ip.to_string(), (asn.clone(), name.clone()));
-    (asn, name)
+    guard.insert(
+        ip.to_string(),
+        (origin.asn.clone(), name.clone(), origin.country.clone()),
+    );
+    (origin.asn, name, origin.country)
 }
 
 pub fn web_egress() -> String {
@@ -1583,6 +1656,63 @@ traceroute to 1.1.1.1 (1.1.1.1), 6 hops max, 52 byte packets
             "CLOUDFLARENET"
         );
         assert_eq!(parse_asn_txt("nope"), "");
+    }
+
+    #[test]
+    fn origin_text_names_the_country_in_chinese_on_the_nat_line() {
+        let text = "\"4134 | 202.97.0.0/16 | CN | apnic | 2002-01-01\"\n";
+        let origin = parse_origin_txt(text);
+        assert_eq!(origin.asn, "AS4134");
+        assert_eq!(origin.country, "CN");
+        assert_eq!(parse_asn_txt(text), "AS4134");
+        let country = crate::geo::country_zh(&origin.country);
+        assert_eq!(country, "中国");
+        assert!(!country.contains("CN"));
+        assert_eq!(
+            with_exit_place("NAT 192.168.1.20 → 203.0.113.8", &country, ""),
+            "NAT 192.168.1.20 → 203.0.113.8 · 中国"
+        );
+        assert_eq!(
+            with_exit_place("NAT 192.168.1.20 → 203.0.113.8", &country, "上海"),
+            "NAT 192.168.1.20 → 203.0.113.8 · 中国 · 上海"
+        );
+        assert_eq!(
+            with_exit_place("NAT 192.168.1.20 → 203.0.113.8 · 对称", &country, ""),
+            "NAT 192.168.1.20 → 203.0.113.8 · 对称 · 中国"
+        );
+        assert!(
+            !with_exit_place("NAT 192.168.1.20 → 203.0.113.8", &country, "").contains("AS4134")
+        );
+        assert!(
+            !with_exit_place("NAT 192.168.1.20 → 203.0.113.8", &country, "").contains("CHINANET")
+        );
+        let lower = parse_origin_txt("4134 | 202.97.0.0/16 | cn | apnic | 2002-01-01");
+        assert_eq!(crate::geo::country_zh(&lower.country), "中国");
+        let blank = parse_origin_txt("4134 | 202.97.0.0/16 |  | apnic | 2002-01-01");
+        assert_eq!(blank.asn, "AS4134");
+        assert_eq!(blank.country, "");
+        assert_eq!(crate::geo::country_zh("ZZ"), "");
+    }
+
+    #[test]
+    fn nat_line_without_a_place_stays_the_address_translation() {
+        let line = nat_fact("192.168.1.20", "203.0.113.8", "203.0.113.8", None, &[]);
+        assert_eq!(line, "NAT 192.168.1.20 → 203.0.113.8");
+        assert_eq!(with_exit_place(&line, "", ""), line);
+        assert_eq!(with_exit_place(&line, "", "上海"), line);
+        assert_eq!(
+            with_exit_place(&line, &crate::geo::country_zh("ZZ"), ""),
+            line
+        );
+        assert_eq!(
+            with_exit_place("路径上有运营商地址 100.64.0.1", "中国", "上海"),
+            "路径上有运营商地址 100.64.0.1"
+        );
+        assert_eq!(with_exit_place("", "中国", "上海"), "");
+        assert_eq!(exit_public("203.0.113.8", "198.51.100.9"), "203.0.113.8");
+        assert_eq!(exit_public("192.168.1.1", "203.0.113.8"), "203.0.113.8");
+        assert_eq!(exit_public("100.64.1.2", ""), "");
+        assert_eq!(exit_public("", ""), "");
     }
 
     #[test]
@@ -1971,6 +2101,7 @@ traceroute to 1.1.1.1 (1.1.1.1), 6 hops max, 52 byte packets
             "dns-slow",
             "proxy-down",
             "proxy-slow",
+            "router-lan",
         ] {
             let book = playbook(id);
             assert_eq!(book.id, id);
